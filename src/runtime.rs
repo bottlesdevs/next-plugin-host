@@ -199,3 +199,69 @@ impl PluginHandle {
         self.instance.lock().await.take();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::package::build_source;
+
+    #[test]
+    fn random_storefront_component_links_an_account() {
+        futures_lite::future::block_on(async {
+            let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .unwrap();
+            let source = workspace.join("plugins/random-storefront");
+            let temporary = std::env::temp_dir().join(format!(
+                "bottles-random-storefront-{}",
+                uuid::Uuid::new_v4()
+            ));
+            async_fs::create_dir_all(temporary.join("src"))
+                .await
+                .unwrap();
+            async_fs::copy(source.join("plugin.toml"), temporary.join("plugin.toml"))
+                .await
+                .unwrap();
+            async_fs::copy(source.join("src/lib.rs"), temporary.join("src/lib.rs"))
+                .await
+                .unwrap();
+            let api = workspace.join("crates/next-plugin-api");
+            async_fs::write(
+                temporary.join("Cargo.toml"),
+                format!(
+                    r#"[package]
+name = "random-storefront-test"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bottles-plugin-api = {{ path = {:?} }}
+uuid = {{ version = "1", features = ["v4"] }}
+
+[workspace]
+"#,
+                    api
+                ),
+            )
+            .await
+            .unwrap();
+
+            let package = build_source(&temporary).await.unwrap();
+            let handle = PluginHandle::load(temporary.join("data"), &package)
+                .await
+                .unwrap();
+            let account = handle
+                .link_account(uuid::Uuid::new_v4().to_string())
+                .await
+                .unwrap();
+            assert!(account.display_name.starts_with("Random Account "));
+            assert!(uuid::Uuid::parse_str(&account.account_id).is_ok());
+            handle.close().await;
+            async_fs::remove_dir_all(temporary).await.unwrap();
+        });
+    }
+}

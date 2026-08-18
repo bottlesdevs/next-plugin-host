@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bottles_core::{Bottles, Profiles};
 use uuid::NonNilUuid;
 
-use crate::runtime::PluginHandle;
+use crate::{Error, Result, runtime::PluginHandle};
 
 use storefront::StorefrontAccountAdapter;
 
@@ -22,18 +22,20 @@ impl PluginAdapters {
     }
 
     /// Registers the contributions declared by a loaded plugin.
-    pub(crate) fn register(&self, handle: Arc<PluginHandle>) {
+    pub(crate) fn register(&self, handle: Arc<PluginHandle>) -> Result<()> {
         let plugin_id = handle.manifest().id;
         if handle.manifest().storefront_account {
             self.profiles
-                .register_account_provider(Arc::new(StorefrontAccountAdapter::new(handle)));
+                .register_account_provider(Arc::new(StorefrontAccountAdapter::new(handle)))
+                .map_err(|error| Error::Host(error.to_string()))?;
         } else {
             self.unregister(plugin_id);
         }
+        Ok(())
     }
 
     /// Removes every native adapter owned by a plugin.
     pub(crate) fn unregister(&self, plugin_id: NonNilUuid) {
-        self.profiles.unregister_account_provider(plugin_id);
+        let _ = self.profiles.unregister_account_provider(plugin_id);
     }
 }

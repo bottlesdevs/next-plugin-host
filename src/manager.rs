@@ -98,7 +98,7 @@ impl PluginManager {
                 .get_mut(&plugin_id)
                 .ok_or(Error::PluginNotFound(plugin_id))?;
 
-            self.adapters.register(handle.clone());
+            self.adapters.register(handle.clone())?;
 
             std::mem::replace(entry, PluginEntry::Loaded(handle))
         };
@@ -174,8 +174,13 @@ impl PluginManager {
             let plugin = match PluginHandle::load(self.data_directory(), &package).await {
                 Ok(handle) => {
                     let handle = Arc::new(handle);
-                    self.adapters.register(handle.clone());
-                    PluginEntry::Loaded(handle)
+                    match self.adapters.register(handle.clone()) {
+                        Ok(()) => PluginEntry::Loaded(handle),
+                        Err(error) => PluginEntry::Failed {
+                            manifest: handle.manifest().clone(),
+                            error: error.to_string(),
+                        },
+                    }
                 }
                 Err(error) => PluginEntry::Failed {
                     manifest: package.manifest,
@@ -191,19 +196,34 @@ impl PluginManager {
     /// Initializes before changing either the installed files or live instance.
     async fn replace_package(&self, package: ValidatedPackage) -> Result<PluginInfo> {
         let handle = Arc::new(PluginHandle::load(self.data_directory(), &package).await?);
-        activate_package(
+        let plugin_id = handle.manifest().id;
+        let previous = self.plugins.lock().await.get(&plugin_id).and_then(|entry| {
+            if let PluginEntry::Loaded(handle) = entry {
+                Some(handle.clone())
+            } else {
+                None
+            }
+        });
+        self.adapters.register(handle.clone())?;
+        if let Err(error) = activate_package(
             &package,
             &self.installed_directory(),
             &self.staging_directory(),
         )
-        .await?;
+        .await
+        {
+            if let Some(previous) = previous {
+                self.adapters.register(previous)?;
+            } else {
+                self.adapters.unregister(plugin_id);
+            }
+            return Err(error);
+        }
         let info = PluginInfo {
             manifest: handle.manifest().clone(),
             status: PluginStatus::Loaded,
         };
-        let plugin_id = handle.manifest().id;
         let old = {
-            self.adapters.register(handle.clone());
             self.plugins
                 .lock()
                 .await
