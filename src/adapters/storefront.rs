@@ -26,6 +26,10 @@ impl StorefrontAccountProvider for StorefrontAccountAdapter {
         }
     }
 
+    fn is_extension(&self) -> bool {
+        true
+    }
+
     async fn link_account(&self, profile_id: Uuid) -> Result<AccountIdentity, String> {
         self.handle
             .link_account(profile_id.to_string())
