@@ -1,0 +1,30 @@
+[package]
+name = "bottles-plugin-host"
+description = "Wasm plugin host for Bottles Next"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-fs.workspace = true
+async-io.workspace = true
+async-process.workspace = true
+bottles-core.workspace = true
+bottles-plugin-api = { path = "../next-plugin-api" }
+futures-lite.workspace = true
+semver.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+toml = "0.9.10"
+tracing.workspace = true
+url.workspace = true
+uuid = { workspace = true, features = ["serde"] }
+wasmparser = "0.256"
+wasmtime = { version = "47", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation"] }
+wasmtime-wasi = { version = "47", default-features = false, features = ["p2"] }
+
+[dev-dependencies]
+tempfile = "3"
