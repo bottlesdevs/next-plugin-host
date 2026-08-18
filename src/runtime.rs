@@ -1,12 +1,13 @@
 use std::{path::PathBuf, sync::OnceLock, time::Duration};
 
+use uuid::NonNilUuid;
 use wasmtime::{
     Engine, Store, StoreLimitsBuilder,
     component::{Component, Linker, ResourceTable},
 };
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use crate::{Error, PluginManifest, Result, bindings::Plugin as GuestPlugin};
+use crate::{Error, Result, bindings::Plugin as GuestPlugin, package::ValidatedPackage};
 
 const INITIALIZATION_FUEL: u64 = 10_000_000;
 const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -40,6 +41,34 @@ impl WasiView for HostState {
             ctx: &mut self.wasi,
             table: &mut self.table,
         }
+    }
+}
+
+impl HostState {
+    /// Creates the per-plugin WASI sandbox and persistent data mount.
+    async fn new(data_directory: PathBuf, plugin_id: NonNilUuid) -> Result<Self> {
+        let data_directory = data_directory.join(plugin_id.to_string());
+        async_fs::create_dir_all(&data_directory).await?;
+        let data_directory = async_fs::canonicalize(data_directory).await?;
+        let mut wasi = WasiCtxBuilder::new();
+        wasi.initial_cwd(".")
+            .allow_tcp(false)
+            .allow_udp(false)
+            .max_random_size(1024 * 1024);
+        wasi.preopened_dir(&data_directory, ".", DirPerms::all(), FilePerms::all())
+            .map_err(|error| Error::Host(error.to_string()))?;
+        Ok(Self {
+            table: ResourceTable::new(),
+            wasi: wasi.build(),
+            limits: StoreLimitsBuilder::new()
+                .memory_size(64 * 1024 * 1024)
+                .memories(4)
+                .instances(8)
+                .tables(16)
+                .table_elements(100_000)
+                .trap_on_grow_failure(true)
+                .build(),
+        })
     }
 }
 
@@ -78,16 +107,12 @@ impl PluginInstance {
     ///
     /// An instance is returned only after initialization completes within the
     /// configured fuel, memory, and wall-clock limits.
-    pub async fn load(
-        data_directory: PathBuf,
-        manifest: &PluginManifest,
-        component: &[u8],
-    ) -> Result<Self> {
+    pub async fn load(data_directory: PathBuf, package: &ValidatedPackage) -> Result<Self> {
         let runtime = runtime()?;
-        let plugin_id = manifest.id.to_string();
-        let component = Component::from_binary(&runtime.engine, component)
+        let plugin_id = package.manifest.id.to_string();
+        let component = Component::from_binary(&runtime.engine, &package.component)
             .map_err(|error| Error::Load(plugin_id.clone(), error.to_string()))?;
-        let state = build_state(data_directory, manifest)
+        let state = HostState::new(data_directory, package.manifest.id)
             .await
             .map_err(|error| Error::Load(plugin_id.clone(), error.to_string()))?;
         let mut store = Store::new(&runtime.engine, state);
@@ -117,31 +142,4 @@ impl PluginInstance {
         .await?;
         Ok(Self { _store: store })
     }
-}
-
-/// Creates the per-plugin WASI sandbox and persistent work mount.
-async fn build_state(data_directory: PathBuf, manifest: &PluginManifest) -> Result<HostState> {
-    let plugin_directory = data_directory.join(manifest.id.to_string());
-    let work_directory = plugin_directory.join("work");
-    async_fs::create_dir_all(&work_directory).await?;
-    let work_directory = async_fs::canonicalize(work_directory).await?;
-    let mut wasi = WasiCtxBuilder::new();
-    wasi.initial_cwd(".")
-        .allow_tcp(false)
-        .allow_udp(false)
-        .max_random_size(1024 * 1024);
-    wasi.preopened_dir(&work_directory, ".", DirPerms::all(), FilePerms::all())
-        .map_err(|error| Error::Host(error.to_string()))?;
-    Ok(HostState {
-        table: ResourceTable::new(),
-        wasi: wasi.build(),
-        limits: StoreLimitsBuilder::new()
-            .memory_size(64 * 1024 * 1024)
-            .memories(4)
-            .instances(8)
-            .tables(16)
-            .table_elements(100_000)
-            .trap_on_grow_failure(true)
-            .build(),
-    })
 }

@@ -25,16 +25,24 @@ pub struct PluginManager {
 }
 
 impl PluginManager {
-    fn plugins_directory(&self) -> PathBuf {
+    fn root_directory(&self) -> PathBuf {
         self.directories.data_dir().join("plugins")
     }
 
-    fn data_directory(&self) -> PathBuf {
-        self.directories.data_dir().join("plugin-data")
+    fn installed_directory(&self) -> PathBuf {
+        self.root_directory().join("installed")
     }
 
-    fn installed_directory(&self, plugin_id: NonNilUuid) -> PathBuf {
-        self.plugins_directory().join(plugin_id.to_string())
+    fn data_directory(&self) -> PathBuf {
+        self.root_directory().join("data")
+    }
+
+    fn staging_directory(&self) -> PathBuf {
+        self.root_directory().join("staging")
+    }
+
+    fn package_directory(&self, plugin_id: NonNilUuid) -> PathBuf {
+        self.installed_directory().join(plugin_id.to_string())
     }
 
     /// Discovers and initializes packages beneath Bottles' plugin directory.
@@ -42,15 +50,13 @@ impl PluginManager {
     /// Invalid packages are skipped independently. Valid packages whose
     /// components fail to load remain visible with [`PluginStatus::Failed`].
     pub async fn open(bottles: &Bottles) -> Result<Self> {
-        let directories = bottles.directories().clone();
-        let plugins_directory = directories.data_dir().join("plugins");
-        let data_directory = directories.data_dir().join("plugin-data");
-        async_fs::create_dir_all(&plugins_directory).await?;
-        async_fs::create_dir_all(&data_directory).await?;
         let manager = Self {
-            directories,
+            directories: bottles.directories().clone(),
             plugins: Mutex::new(HashMap::new()),
         };
+        async_fs::create_dir_all(manager.installed_directory()).await?;
+        async_fs::create_dir_all(manager.data_directory()).await?;
+        async_fs::create_dir_all(manager.staging_directory()).await?;
         manager.discover().await?;
         Ok(manager)
     }
@@ -74,16 +80,14 @@ impl PluginManager {
         if !self.plugins.lock().await.contains_key(&plugin_id) {
             return Err(Error::PluginNotFound(plugin_id));
         }
-        let package = validate_package(&self.installed_directory(plugin_id)).await?;
+        let package = validate_package(&self.package_directory(plugin_id)).await?;
         if package.manifest.id != plugin_id {
             return Err(Error::InvalidManifest(format!(
                 "installed directory {plugin_id:?} contains plugin {:?}",
                 package.manifest.id
             )));
         }
-        let instance =
-            PluginInstance::load(self.data_directory(), &package.manifest, &package.component)
-                .await?;
+        let instance = PluginInstance::load(self.data_directory(), &package).await?;
         let old = {
             let mut plugins = self.plugins.lock().await;
             let entry = plugins
@@ -109,7 +113,7 @@ impl PluginManager {
     pub async fn uninstall(&self, plugin_id: NonNilUuid) -> Result<()> {
         let old = self.plugins.lock().await.remove(&plugin_id);
         drop(old); // Otherwise WASI resources remain open while their files are deleted.
-        remove_directory(self.installed_directory(plugin_id)).await?;
+        remove_directory(self.package_directory(plugin_id)).await?;
         remove_directory(self.data_directory().join(plugin_id.to_string())).await?;
         Ok(())
     }
@@ -128,7 +132,7 @@ impl PluginManager {
     }
 
     async fn discover(&self) -> Result<()> {
-        let mut directories = async_fs::read_dir(self.plugins_directory()).await?;
+        let mut directories = async_fs::read_dir(self.installed_directory()).await?;
         let mut discovered = HashMap::new();
         while let Some(entry) = directories.next().await.transpose()? {
             if !entry.file_type().await?.is_dir() {
@@ -160,13 +164,7 @@ impl PluginManager {
                 );
                 continue;
             }
-            let state = match PluginInstance::load(
-                self.data_directory(),
-                &package.manifest,
-                &package.component,
-            )
-            .await
-            {
+            let state = match PluginInstance::load(self.data_directory(), &package).await {
                 Ok(instance) => PluginState::Enabled {
                     _instance: instance,
                 },
@@ -186,10 +184,13 @@ impl PluginManager {
 
     /// Initializes before changing either the installed files or live instance.
     async fn replace_package(&self, package: ValidatedPackage) -> Result<PluginInfo> {
-        let instance =
-            PluginInstance::load(self.data_directory(), &package.manifest, &package.component)
-                .await?;
-        activate_package(&package, &self.plugins_directory()).await?;
+        let instance = PluginInstance::load(self.data_directory(), &package).await?;
+        activate_package(
+            &package,
+            &self.installed_directory(),
+            &self.staging_directory(),
+        )
+        .await?;
         let info = PluginInfo {
             manifest: package.manifest.clone(),
             status: PluginStatus::Enabled,

@@ -107,7 +107,7 @@ pub async fn validate_package(directory: &Path) -> Result<ValidatedPackage> {
 
 /// Parses the complete component and requires its embedded API version to match
 /// both the manifest and this host.
-pub fn validate_component(manifest: &PluginManifest, bytes: &[u8]) -> Result<()> {
+fn validate_component(manifest: &PluginManifest, bytes: &[u8]) -> Result<()> {
     let mut found = None;
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(|error| Error::InvalidComponent(error.to_string()))?;
@@ -138,7 +138,7 @@ pub fn validate_component(manifest: &PluginManifest, bytes: &[u8]) -> Result<()>
 
 /// Materializes a package in a new directory, removing partial output when a
 /// write fails.
-pub async fn write_package(package: &ValidatedPackage, destination: &Path) -> Result<()> {
+async fn write_package(package: &ValidatedPackage, destination: &Path) -> Result<()> {
     if destination.exists() {
         return Err(Error::Host(format!(
             "package destination {} already exists",
@@ -160,15 +160,22 @@ pub async fn write_package(package: &ValidatedPackage, destination: &Path) -> Re
     result
 }
 
-/// Replaces the installed package through a sibling staging directory.
+/// Replaces the installed package through a staging directory on the same
+/// filesystem.
 ///
 /// The existing package is removed before the staging rename. A rename failure
 /// therefore leaves the plugin uninstalled rather than restoring the old files.
-pub async fn activate_package(package: &ValidatedPackage, plugins_directory: &Path) -> Result<()> {
-    async_fs::create_dir_all(plugins_directory).await?;
-    let plugins_directory = async_fs::canonicalize(plugins_directory).await?;
-    let destination = plugins_directory.join(package.manifest.id.to_string());
-    let staging = plugins_directory.join(format!(".stage-{}", Uuid::new_v4()));
+pub async fn activate_package(
+    package: &ValidatedPackage,
+    installed_directory: &Path,
+    staging_directory: &Path,
+) -> Result<()> {
+    async_fs::create_dir_all(installed_directory).await?;
+    async_fs::create_dir_all(staging_directory).await?;
+    let installed_directory = async_fs::canonicalize(installed_directory).await?;
+    let staging_directory = async_fs::canonicalize(staging_directory).await?;
+    let destination = installed_directory.join(package.manifest.id.to_string());
+    let staging = staging_directory.join(Uuid::new_v4().to_string());
     write_package(package, &staging).await?;
     match async_fs::remove_dir_all(&destination).await {
         Ok(()) => {}
