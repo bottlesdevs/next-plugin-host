@@ -15,8 +15,10 @@ pub enum Error {
     ApiVersion { actual: String, expected: String },
     #[error("plugin component is invalid: {0}")]
     InvalidComponent(String),
-    #[error("plugin {0:?} failed to load: {1}")]
-    Load(String, String),
+    #[error("plugin {0} failed to load: {1}")]
+    Load(NonNilUuid, String),
+    #[error("plugin {0} callback failed: {1}")]
+    Callback(NonNilUuid, String),
     #[error("host operation failed: {0}")]
     Host(String),
     #[error("I/O error: {0}")]

@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use bottles_core::{Bottles, Directories};
@@ -11,8 +12,9 @@ use uuid::{NonNilUuid, Uuid};
 
 use crate::{
     Error, PluginManifest, Result,
+    adapters::PluginAdapters,
     package::{ValidatedPackage, activate_package, build_source, validate_package},
-    runtime::PluginInstance,
+    runtime::PluginHandle,
 };
 
 /// Owns installed-plugin discovery and the initialized instances.
@@ -21,6 +23,7 @@ use crate::{
 /// initialized at startup.
 pub struct PluginManager {
     directories: Directories,
+    adapters: PluginAdapters,
     plugins: Mutex<HashMap<NonNilUuid, PluginEntry>>,
 }
 
@@ -52,6 +55,7 @@ impl PluginManager {
     pub async fn open(bottles: &Bottles) -> Result<Self> {
         let manager = Self {
             directories: bottles.directories().clone(),
+            adapters: PluginAdapters::new(bottles),
             plugins: Mutex::new(HashMap::new()),
         };
         async_fs::create_dir_all(manager.installed_directory()).await?;
@@ -68,8 +72,8 @@ impl PluginManager {
             .await
             .values()
             .map(|entry| PluginInfo {
-                manifest: entry.manifest.clone(),
-                status: entry.state.status(),
+                manifest: entry.manifest().clone(),
+                status: entry.status(),
             })
             .collect()
     }
@@ -87,32 +91,34 @@ impl PluginManager {
                 package.manifest.id
             )));
         }
-        let instance = PluginInstance::load(self.data_directory(), &package).await?;
+        let handle = Arc::new(PluginHandle::load(self.data_directory(), &package).await?);
         let old = {
             let mut plugins = self.plugins.lock().await;
             let entry = plugins
                 .get_mut(&plugin_id)
                 .ok_or(Error::PluginNotFound(plugin_id))?;
 
-            std::mem::replace(
-                entry,
-                PluginEntry {
-                    manifest: package.manifest,
-                    state: PluginState::Enabled {
-                        _instance: instance,
-                    },
-                },
-            )
+            self.adapters.register(handle.clone());
+
+            std::mem::replace(entry, PluginEntry::Loaded(handle))
         };
-        drop(old); // Otherwise the replaced store lives until reload returns.
+        if let PluginEntry::Loaded(handle) = old {
+            handle.close().await;
+        }
         Ok(())
     }
 
-    /// Drops the resident instance before removing its package and private data.
+    /// Closes the initialized instance before removing its package and private data.
     /// Missing directories are accepted so interrupted removals can be retried.
     pub async fn uninstall(&self, plugin_id: NonNilUuid) -> Result<()> {
-        let old = self.plugins.lock().await.remove(&plugin_id);
-        drop(old); // Otherwise WASI resources remain open while their files are deleted.
+        let old = {
+            let old = self.plugins.lock().await.remove(&plugin_id);
+            self.adapters.unregister(plugin_id);
+            old
+        };
+        if let Some(PluginEntry::Loaded(handle)) = old {
+            handle.close().await;
+        }
         remove_directory(self.package_directory(plugin_id)).await?;
         remove_directory(self.data_directory().join(plugin_id.to_string())).await?;
         Ok(())
@@ -164,19 +170,19 @@ impl PluginManager {
                 );
                 continue;
             }
-            let state = match PluginInstance::load(self.data_directory(), &package).await {
-                Ok(instance) => PluginState::Enabled {
-                    _instance: instance,
-                },
-                Err(error) => PluginState::Failed(error.to_string()),
-            };
-            discovered.insert(
-                package.manifest.id,
-                PluginEntry {
+            let plugin_id = package.manifest.id;
+            let plugin = match PluginHandle::load(self.data_directory(), &package).await {
+                Ok(handle) => {
+                    let handle = Arc::new(handle);
+                    self.adapters.register(handle.clone());
+                    PluginEntry::Loaded(handle)
+                }
+                Err(error) => PluginEntry::Failed {
                     manifest: package.manifest,
-                    state,
+                    error: error.to_string(),
                 },
-            );
+            };
+            discovered.insert(plugin_id, plugin);
         }
         *self.plugins.lock().await = discovered;
         Ok(())
@@ -184,7 +190,7 @@ impl PluginManager {
 
     /// Initializes before changing either the installed files or live instance.
     async fn replace_package(&self, package: ValidatedPackage) -> Result<PluginInfo> {
-        let instance = PluginInstance::load(self.data_directory(), &package).await?;
+        let handle = Arc::new(PluginHandle::load(self.data_directory(), &package).await?);
         activate_package(
             &package,
             &self.installed_directory(),
@@ -192,19 +198,20 @@ impl PluginManager {
         )
         .await?;
         let info = PluginInfo {
-            manifest: package.manifest.clone(),
-            status: PluginStatus::Enabled,
+            manifest: handle.manifest().clone(),
+            status: PluginStatus::Loaded,
         };
-        let old = self.plugins.lock().await.insert(
-            package.manifest.id,
-            PluginEntry {
-                manifest: package.manifest,
-                state: PluginState::Enabled {
-                    _instance: instance,
-                },
-            },
-        );
-        drop(old); // Otherwise the replaced store lives until installation returns.
+        let plugin_id = handle.manifest().id;
+        let old = {
+            self.adapters.register(handle.clone());
+            self.plugins
+                .lock()
+                .await
+                .insert(plugin_id, PluginEntry::Loaded(handle))
+        };
+        if let Some(PluginEntry::Loaded(handle)) = old {
+            handle.close().await;
+        }
         Ok(info)
     }
 }
@@ -213,22 +220,32 @@ impl PluginManager {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PluginStatus {
-    /// Initialization succeeded and the instance remains resident.
-    Enabled,
+    /// Initialization succeeded and the instance remains loaded.
+    Loaded,
     /// The package remains installed, but compilation or initialization failed.
     Failed(String),
 }
 
-enum PluginState {
-    Enabled { _instance: PluginInstance },
-    Failed(String),
+enum PluginEntry {
+    Loaded(Arc<PluginHandle>),
+    Failed {
+        manifest: PluginManifest,
+        error: String,
+    },
 }
 
-impl PluginState {
+impl PluginEntry {
+    fn manifest(&self) -> &PluginManifest {
+        match self {
+            Self::Loaded(handle) => handle.manifest(),
+            Self::Failed { manifest, .. } => manifest,
+        }
+    }
+
     fn status(&self) -> PluginStatus {
         match self {
-            Self::Enabled { .. } => PluginStatus::Enabled,
-            Self::Failed(error) => PluginStatus::Failed(error.clone()),
+            Self::Loaded(_) => PluginStatus::Loaded,
+            Self::Failed { error, .. } => PluginStatus::Failed(error.clone()),
         }
     }
 }
@@ -238,13 +255,8 @@ impl PluginState {
 pub struct PluginInfo {
     /// Manifest accepted during package discovery or installation.
     pub manifest: PluginManifest,
-    /// Whether initialization produced a resident store or failed.
+    /// Whether initialization produced a loaded instance or failed.
     pub status: PluginStatus,
-}
-
-struct PluginEntry {
-    manifest: PluginManifest,
-    state: PluginState,
 }
 
 async fn remove_directory(path: PathBuf) -> Result<()> {

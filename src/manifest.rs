@@ -19,6 +19,8 @@ pub struct PluginManifest {
     pub license: String,
     pub repository: url::Url,
     pub api_version: Version,
+    #[serde(default)]
+    pub storefront_account: bool,
 }
 
 impl PluginManifest {

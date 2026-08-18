@@ -11,6 +11,7 @@ repository.workspace = true
 async-fs.workspace = true
 async-io.workspace = true
 async-process.workspace = true
+async-trait.workspace = true
 bottles-core.workspace = true
 bottles-plugin-api = { path = "../next-plugin-api" }
 futures-lite.workspace = true

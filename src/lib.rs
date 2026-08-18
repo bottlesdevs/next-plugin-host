@@ -1,3 +1,4 @@
+mod adapters;
 mod bindings;
 mod error;
 mod manager;
