@@ -1,48 +1,37 @@
-use std::{path::PathBuf, sync::OnceLock, time::Duration};
+use std::sync::Arc;
 
-use bottles_core::AccountIdentity;
 use tokio::sync::Mutex;
-use uuid::NonNilUuid;
 use wasmtime::{
-    Engine, Store, StoreLimitsBuilder,
-    component::{Component, Linker, ResourceTable},
+    Engine, Store,
+    component::{Component, HasSelf, Linker, Resource, ResourceAny, ResourceTable},
 };
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_http::{
+    WasiHttpCtx,
+    p2::{WasiHttpCtxView, WasiHttpView},
+};
 
 use crate::{
-    Error, PluginManifest, Result, bindings::Plugin as GuestPlugin, package::ValidatedPackage,
+    AccountLinkInteraction, LinkedAccount, PluginKind, Result,
+    bindings::{self, bottles::plugin::account_link},
 };
 
-const INITIALIZATION_FUEL: u64 = 10_000_000;
-const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Compilation and linking state shared by all plugin instances.
-///
-/// Guest stores are created separately and never share mutable state.
-struct Runtime {
-    engine: Engine,
-    linker: Linker<HostState>,
-}
-
-/// Provides serialized access to one initialized plugin instance.
-pub(crate) struct PluginHandle {
-    manifest: PluginManifest,
-    instance: Mutex<Option<PluginInstance>>,
+/// One initialized WebAssembly component and its persistent plugin resource.
+pub struct Plugin {
+    provides: Vec<PluginKind>,
+    instance: Mutex<PluginInstance>,
 }
 
 struct PluginInstance {
     store: Store<HostState>,
-    guest: GuestPlugin,
+    guest: bindings::Plugin,
+    resource: ResourceAny,
 }
 
-/// Store-owned capabilities and resource limits for one plugin instance.
-///
-/// Filesystem access is restricted to the plugin's persistent work directory,
-/// and raw TCP and UDP sockets are unavailable.
-pub(crate) struct HostState {
-    pub table: ResourceTable,
-    pub wasi: WasiCtx,
-    pub limits: wasmtime::StoreLimits,
+struct HostState {
+    table: ResourceTable,
+    wasi: WasiCtx,
+    http: WasiHttpCtx,
 }
 
 impl WasiView for HostState {
@@ -54,214 +43,116 @@ impl WasiView for HostState {
     }
 }
 
-impl HostState {
-    /// Creates the per-plugin WASI sandbox and persistent data mount.
-    async fn new(data_directory: PathBuf, plugin_id: NonNilUuid) -> Result<Self> {
-        let data_directory = data_directory.join(plugin_id.to_string());
-        async_fs::create_dir_all(&data_directory).await?;
-        let data_directory = async_fs::canonicalize(data_directory).await?;
-        let mut wasi = WasiCtxBuilder::new();
-        wasi.initial_cwd(".")
-            .allow_tcp(false)
-            .allow_udp(false)
-            .max_random_size(1024 * 1024);
-        wasi.preopened_dir(&data_directory, ".", DirPerms::all(), FilePerms::all())
-            .map_err(|error| Error::Host(error.to_string()))?;
-        Ok(Self {
+impl WasiHttpView for HostState {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: Default::default(),
+        }
+    }
+}
+
+impl account_link::HostInteraction for HostState {
+    async fn request_input(
+        &mut self,
+        interaction: Resource<Arc<dyn AccountLinkInteraction>>,
+        url: String,
+        instructions: String,
+    ) -> wasmtime::Result<std::result::Result<String, String>> {
+        let interaction = self.table.get(&interaction)?.clone();
+        Ok(interaction.request_input(url, instructions).await)
+    }
+
+    async fn drop(
+        &mut self,
+        interaction: Resource<Arc<dyn AccountLinkInteraction>>,
+    ) -> wasmtime::Result<()> {
+        self.table.delete(interaction)?;
+        Ok(())
+    }
+}
+
+impl account_link::Host for HostState {}
+
+impl Plugin {
+    /// Compiles and initializes one component with standard WASI and WASI HTTP.
+    pub async fn load(component: &[u8]) -> Result<Self> {
+        let engine = Engine::new(&wasmtime::Config::new()).map_err(|error| error.to_string())?;
+        let mut linker = Linker::new(&engine);
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|error| error.to_string())?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
+            .map_err(|error| error.to_string())?;
+        account_link::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+            .map_err(|error| error.to_string())?;
+
+        let component =
+            Component::from_binary(&engine, component).map_err(|error| error.to_string())?;
+        let state = HostState {
             table: ResourceTable::new(),
-            wasi: wasi.build(),
-            limits: StoreLimitsBuilder::new()
-                .memory_size(64 * 1024 * 1024)
-                .memories(4)
-                .instances(8)
-                .tables(16)
-                .table_elements(100_000)
-                .trap_on_grow_failure(true)
-                .build(),
-        })
-    }
-}
-
-fn runtime() -> Result<&'static Runtime> {
-    static RUNTIME: OnceLock<std::result::Result<Runtime, String>> = OnceLock::new();
-    RUNTIME
-        .get_or_init(|| {
-            let mut config = wasmtime::Config::new();
-            config
-                .consume_fuel(true)
-                .epoch_interruption(true)
-                .wasm_component_model(true);
-            let engine = Engine::new(&config).map_err(|error| error.to_string())?;
-            let ticker = engine.clone();
-            // Advancing epochs periodically yields guest execution to its executor.
-            std::thread::Builder::new()
-                .name("bottles-plugin-epoch".into())
-                .spawn(move || {
-                    loop {
-                        std::thread::sleep(Duration::from_millis(100));
-                        ticker.increment_epoch();
-                    }
-                })
-                .map_err(|error| error.to_string())?;
-            let mut linker = Linker::new(&engine);
-            wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-                .map_err(|error| error.to_string())?;
-            Ok(Runtime { engine, linker })
-        })
-        .as_ref()
-        .map_err(|error| Error::Host(error.clone()))
-}
-
-impl PluginHandle {
-    /// Compiles and initializes a component in a fresh, isolated store.
-    ///
-    /// An instance is returned only after initialization completes within the
-    /// configured fuel, memory, and wall-clock limits.
-    pub async fn load(data_directory: PathBuf, package: &ValidatedPackage) -> Result<Self> {
-        let runtime = runtime()?;
-        let plugin_id = package.manifest.id;
-        let component = Component::from_binary(&runtime.engine, &package.component)
-            .map_err(|error| Error::Load(plugin_id, error.to_string()))?;
-        let state = HostState::new(data_directory, package.manifest.id)
+            wasi: WasiCtxBuilder::new().build(),
+            http: WasiHttpCtx::new(),
+        };
+        let mut store = Store::new(&engine, state);
+        let guest = bindings::Plugin::instantiate_async(&mut store, &component, &linker)
             .await
-            .map_err(|error| Error::Load(plugin_id, error.to_string()))?;
-        let mut store = Store::new(&runtime.engine, state);
-        store.limiter(|state| &mut state.limits);
-        store
-            .set_fuel(INITIALIZATION_FUEL)
-            .map_err(|error| Error::Load(plugin_id, error.to_string()))?;
-        store.set_epoch_deadline(1);
-        store.epoch_deadline_async_yield_and_update(1);
-        let guest = GuestPlugin::instantiate_async(&mut store, &component, &runtime.linker)
+            .map_err(|error| error.to_string())?;
+        let provides = guest
+            .bottles_plugin_lifecycle()
+            .call_provides(&mut store)
             .await
-            .map_err(|error| Error::Load(plugin_id, error.to_string()))?;
-        futures_lite::future::race(
-            async {
-                guest
-                    .call_init_plugin(&mut store)
-                    .await
-                    .map_err(|error| Error::Load(plugin_id, error.to_string()))
-            },
-            async {
-                async_io::Timer::after(INITIALIZATION_TIMEOUT).await;
-                Err(Error::Load(plugin_id, "initialization timed out".into()))
-            },
-        )
-        .await?;
+            .map_err(|error| error.to_string())?;
+        let resource = guest
+            .bottles_plugin_lifecycle()
+            .plugin()
+            .call_new(&mut store)
+            .await
+            .map_err(|error| error.to_string())??;
+
         Ok(Self {
-            manifest: package.manifest.clone(),
-            instance: Mutex::new(Some(PluginInstance { store, guest })),
+            provides,
+            instance: Mutex::new(PluginInstance {
+                store,
+                guest,
+                resource,
+            }),
         })
     }
 
-    pub(crate) fn manifest(&self) -> &PluginManifest {
-        &self.manifest
+    /// The typed subsystem contributions declared by the component.
+    pub fn provides(&self) -> &[PluginKind] {
+        &self.provides
     }
 
-    /// Calls the storefront account contribution on this plugin instance.
-    pub async fn link_account(&self, profile_id: String) -> Result<AccountIdentity> {
+    /// Invokes the storefront account-provider contribution.
+    pub async fn link_account(
+        &self,
+        interaction: Arc<dyn AccountLinkInteraction>,
+    ) -> Result<LinkedAccount> {
         let mut instance = self.instance.lock().await;
-        let instance = instance
-            .as_mut()
-            .ok_or_else(|| Error::Callback(self.manifest.id, "plugin instance is closed".into()))?;
-        instance
-            .store
-            .set_fuel(INITIALIZATION_FUEL)
-            .map_err(|error| Error::Callback(self.manifest.id, error.to_string()))?;
+        let PluginInstance {
+            store,
+            guest,
+            resource,
+        } = &mut *instance;
 
-        let result = futures_lite::future::race(
-            async {
-                instance
-                    .guest
-                    .call_link_account(&mut instance.store, &profile_id)
-                    .await
-                    .map_err(|error| Error::Callback(self.manifest.id, error.to_string()))
-            },
-            async {
-                async_io::Timer::after(INITIALIZATION_TIMEOUT).await;
-                Err(Error::Callback(
-                    self.manifest.id,
-                    "link-account timed out".into(),
-                ))
-            },
-        )
-        .await?
-        .map_err(|message| Error::Callback(self.manifest.id, message))?;
-
-        Ok(AccountIdentity {
-            account_id: result.account_id,
-            display_name: result.display_name,
-        })
-    }
-
-    /// Prevents further callbacks and releases the store after an active call finishes.
-    pub async fn close(&self) {
-        self.instance.lock().await.take();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::package::build_source;
-
-    #[test]
-    fn random_storefront_component_links_an_account() {
-        futures_lite::future::block_on(async {
-            let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .canonicalize()
-                .unwrap();
-            let source = workspace.join("plugins/random-storefront");
-            let temporary = std::env::temp_dir().join(format!(
-                "bottles-random-storefront-{}",
-                uuid::Uuid::new_v4()
-            ));
-            async_fs::create_dir_all(temporary.join("src"))
-                .await
-                .unwrap();
-            async_fs::copy(source.join("plugin.toml"), temporary.join("plugin.toml"))
-                .await
-                .unwrap();
-            async_fs::copy(source.join("src/lib.rs"), temporary.join("src/lib.rs"))
-                .await
-                .unwrap();
-            let api = workspace.join("crates/next-plugin-api");
-            async_fs::write(
-                temporary.join("Cargo.toml"),
-                format!(
-                    r#"[package]
-name = "random-storefront-test"
-version = "0.1.0"
-edition = "2024"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-bottles-plugin-api = {{ path = {:?} }}
-uuid = {{ version = "1", features = ["v4"] }}
-
-[workspace]
-"#,
-                    api
-                ),
-            )
+        let interaction = store
+            .data_mut()
+            .table
+            .push(interaction)
+            .map_err(|error| error.to_string())?;
+        let borrowed_interaction = Resource::new_borrow(interaction.rep());
+        let result = guest
+            .bottles_plugin_storefront_account_provider()
+            .call_link_account(&mut *store, *resource, borrowed_interaction)
             .await
-            .unwrap();
+            .map_err(|error| error.to_string());
+        store
+            .data_mut()
+            .table
+            .delete(interaction)
+            .map_err(|error| error.to_string())?;
 
-            let package = build_source(&temporary).await.unwrap();
-            let handle = PluginHandle::load(temporary.join("data"), &package)
-                .await
-                .unwrap();
-            let account = handle
-                .link_account(uuid::Uuid::new_v4().to_string())
-                .await
-                .unwrap();
-            assert!(account.display_name.starts_with("Random Account "));
-            assert!(uuid::Uuid::parse_str(&account.account_id).is_ok());
-            handle.close().await;
-            async_fs::remove_dir_all(temporary).await.unwrap();
-        });
+        result?
     }
 }
