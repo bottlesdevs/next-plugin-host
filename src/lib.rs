@@ -6,6 +6,7 @@ use async_trait::async_trait;
 pub use bindings::exports::bottles::plugin::{
     lifecycle::PluginKind,
     storefront_account_provider::{AccountIdentity, LinkedAccount},
+    storefront_library_provider::{ListedGames, OwnedGame},
 };
 pub use runtime::Plugin;
 

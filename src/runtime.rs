@@ -12,7 +12,7 @@ use wasmtime_wasi_http::{
 };
 
 use crate::{
-    AccountLinkInteraction, LinkedAccount, PluginKind, Result,
+    AccountLinkInteraction, LinkedAccount, ListedGames, PluginKind, Result,
     bindings::{self, bottles::plugin::account_link},
 };
 
@@ -129,6 +129,13 @@ impl Plugin {
         &self,
         interaction: Arc<dyn AccountLinkInteraction>,
     ) -> Result<LinkedAccount> {
+        if !self
+            .provides
+            .contains(&PluginKind::StorefrontAccountProvider)
+        {
+            return Err("plugin does not advertise storefront-account-provider".into());
+        }
+
         let mut instance = self.instance.lock().await;
         let PluginInstance {
             store,
@@ -154,5 +161,32 @@ impl Plugin {
             .map_err(|error| error.to_string())?;
 
         result?
+    }
+
+    /// Invokes the storefront library-provider contribution.
+    pub async fn list_games(
+        &self,
+        account_id: &str,
+        credential: Option<&[u8]>,
+    ) -> Result<ListedGames> {
+        if !self
+            .provides
+            .contains(&PluginKind::StorefrontLibraryProvider)
+        {
+            return Err("plugin does not advertise storefront-library-provider".into());
+        }
+
+        let mut instance = self.instance.lock().await;
+        let PluginInstance {
+            store,
+            guest,
+            resource,
+        } = &mut *instance;
+
+        guest
+            .bottles_plugin_storefront_library_provider()
+            .call_list_games(&mut *store, *resource, account_id, credential)
+            .await
+            .map_err(|error| error.to_string())?
     }
 }
