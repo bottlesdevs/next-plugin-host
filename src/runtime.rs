@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use wasmtime::{
     Engine, Store,
     component::{Component, HasSelf, Linker, Resource, ResourceAny, ResourceTable},
@@ -128,6 +129,7 @@ impl Plugin {
     pub async fn link_account(
         &self,
         interaction: Arc<dyn AccountLinkInteraction>,
+        cancellation: &CancellationToken,
     ) -> Result<LinkedAccount> {
         if !self
             .provides
@@ -136,7 +138,10 @@ impl Plugin {
             return Err("plugin does not advertise storefront-account-provider".into());
         }
 
-        let mut instance = self.instance.lock().await;
+        let Some(mut instance) = cancellation.run_until_cancelled(self.instance.lock()).await
+        else {
+            return Err("account linking cancelled".into());
+        };
         let PluginInstance {
             store,
             guest,
@@ -149,18 +154,22 @@ impl Plugin {
             .push(interaction)
             .map_err(|error| error.to_string())?;
         let borrowed_interaction = Resource::new_borrow(interaction.rep());
-        let result = guest
-            .bottles_plugin_storefront_account_provider()
-            .call_link_account(&mut *store, *resource, borrowed_interaction)
-            .await
-            .map_err(|error| error.to_string());
+        let result = cancellation
+            .run_until_cancelled(
+                guest
+                    .bottles_plugin_storefront_account_provider()
+                    .call_link_account(&mut *store, *resource, borrowed_interaction),
+            )
+            .await;
         store
             .data_mut()
             .table
             .delete(interaction)
             .map_err(|error| error.to_string())?;
 
-        result?
+        result
+            .ok_or_else(|| "account linking cancelled".to_owned())?
+            .map_err(|error| error.to_string())?
     }
 
     /// Invokes the storefront library-provider contribution.
