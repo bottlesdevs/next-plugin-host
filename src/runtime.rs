@@ -62,6 +62,10 @@ impl account_link::HostInteraction for HostState {
         instructions: String,
     ) -> wasmtime::Result<std::result::Result<String, String>> {
         let interaction = self.table.get(&interaction)?.clone();
+        let url = match url::Url::parse(&url) {
+            Ok(url) => url,
+            Err(error) => return Ok(Err(format!("invalid interaction URL: {error}"))),
+        };
         Ok(interaction.request_input(url, instructions).await)
     }
 

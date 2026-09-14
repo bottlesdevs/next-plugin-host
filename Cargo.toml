@@ -11,6 +11,7 @@ repository.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true, features = ["rt"] }
+url.workspace = true
 wasmtime = { version = "47", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation"] }
 wasmtime-wasi = { version = "47", default-features = false, features = ["p2"] }
 wasmtime-wasi-http = { version = "47", default-features = false, features = ["default-send-request", "p2"] }
