@@ -1,7 +1,6 @@
 use crate::AccountLinkInteraction;
 use crate::{HostState, Invocation};
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 use wasmtime::component::{HasSelf, InstancePre, Linker, Resource};
 
 mod bindings {
@@ -23,7 +22,7 @@ use bindings::{bottles::plugin::account_link, exports::bottles::plugin::storefro
 pub use storefront_provider::{AccountIdentity, Authentication, LinkedAccount, OwnedGame};
 type Result<T> = std::result::Result<T, String>;
 
-/// Register core's plugin imports once when composing the application runtime.
+/// Register storefront imports once when composing the application runtime.
 pub fn add_plugin_imports(linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
     account_link::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
 }
@@ -56,32 +55,25 @@ impl account_link::Host for HostState {}
 pub async fn link_account(
     component: &InstancePre<HostState>,
     interaction: Arc<dyn AccountLinkInteraction>,
-    cancellation: &CancellationToken,
 ) -> Result<LinkedAccount> {
-    cancellation
-        .run_until_cancelled(async {
-            let indices =
-                storefront_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
-            let mut invocation = Invocation::new(component)
-                .await
-                .map_err(|e| e.to_string())?;
-            let guest = indices
-                .load(&mut invocation.store, &invocation.instance)
-                .map_err(|e| e.to_string())?;
-            let interaction = invocation
-                .store
-                .data_mut()
-                .table
-                .push(interaction)
-                .map_err(|e| e.to_string())?;
-            let borrowed = Resource::new_borrow(interaction.rep());
-            guest
-                .call_link_account(&mut invocation.store, borrowed)
-                .await
-                .map_err(|e| e.to_string())?
-        })
+    let indices = storefront_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
+    let mut invocation = Invocation::new(component)
         .await
-        .ok_or_else(|| "account linking cancelled".to_owned())?
+        .map_err(|e| e.to_string())?;
+    let guest = indices
+        .load(&mut invocation.store, &invocation.instance)
+        .map_err(|e| e.to_string())?;
+    let interaction = invocation
+        .store
+        .data_mut()
+        .table
+        .push(interaction)
+        .map_err(|e| e.to_string())?;
+    let borrowed = Resource::new_borrow(interaction.rep());
+    guest
+        .call_link_account(&mut invocation.store, borrowed)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 pub async fn authenticate(
@@ -106,23 +98,16 @@ pub async fn list_games(
     component: &InstancePre<HostState>,
     account_id: &str,
     access: &[u8],
-    cancellation: &CancellationToken,
 ) -> Result<Vec<OwnedGame>> {
-    cancellation
-        .run_until_cancelled(async {
-            let indices =
-                storefront_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
-            let mut invocation = Invocation::new(component)
-                .await
-                .map_err(|e| e.to_string())?;
-            let guest = indices
-                .load(&mut invocation.store, &invocation.instance)
-                .map_err(|e| e.to_string())?;
-            guest
-                .call_list_games(&mut invocation.store, account_id, access)
-                .await
-                .map_err(|e| e.to_string())?
-        })
+    let indices = storefront_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
+    let mut invocation = Invocation::new(component)
         .await
-        .ok_or_else(|| "library enumeration cancelled".to_owned())?
+        .map_err(|e| e.to_string())?;
+    let guest = indices
+        .load(&mut invocation.store, &invocation.instance)
+        .map_err(|e| e.to_string())?;
+    guest
+        .call_list_games(&mut invocation.store, account_id, access)
+        .await
+        .map_err(|e| e.to_string())?
 }

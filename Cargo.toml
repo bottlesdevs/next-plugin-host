@@ -10,7 +10,6 @@ repository.workspace = true
 [dependencies]
 async-fs.workspace = true
 async-trait.workspace = true
-tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["serde"] }
 blocking.workspace = true
