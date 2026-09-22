@@ -1,5 +1,5 @@
 use crate::AccountLinkInteraction;
-use crate::{HostState, Invocation, LoadedPlugin};
+use crate::{HostState, LoadedPlugin};
 use std::sync::Arc;
 use wasmtime::component::{HasSelf, Linker, Resource};
 
@@ -59,25 +59,23 @@ pub async fn link_account(
     plugin: &LoadedPlugin,
     interaction: Arc<dyn AccountLinkInteraction>,
 ) -> Result<LinkedAccount> {
-    let component = &plugin.component;
-    let indices = account_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
-    let mut invocation = Invocation::new(component)
+    plugin
+        .worker
+        .call(move |invocation| {
+            Box::pin(async move {
+                let indices = account_provider::GuestIndices::new(&invocation.component)?;
+                let guest = indices.load(&mut invocation.store, &invocation.instance)?;
+                let interaction = invocation.store.data_mut().table.push(interaction)?;
+                let borrowed = Resource::new_borrow(interaction.rep());
+                let result = guest
+                    .call_link_account(&mut invocation.store, borrowed)
+                    .await?;
+                invocation.store.data_mut().table.delete(interaction)?;
+                Ok(result)
+            })
+        })
         .await
-        .map_err(|e| e.to_string())?;
-    let guest = indices
-        .load(&mut invocation.store, &invocation.instance)
-        .map_err(|e| e.to_string())?;
-    let interaction = invocation
-        .store
-        .data_mut()
-        .table
-        .push(interaction)
-        .map_err(|e| e.to_string())?;
-    let borrowed = Resource::new_borrow(interaction.rep());
-    guest
-        .call_link_account(&mut invocation.store, borrowed)
-        .await
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
 }
 
 pub async fn authenticate(
@@ -85,18 +83,21 @@ pub async fn authenticate(
     account_id: &str,
     credential: Option<&[u8]>,
 ) -> Result<Authentication> {
-    let component = &plugin.component;
-    let indices = library_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
-    let mut invocation = Invocation::new(component)
+    let account_id = account_id.to_owned();
+    let credential = credential.map(<[u8]>::to_vec);
+    plugin
+        .worker
+        .call(move |invocation| {
+            Box::pin(async move {
+                let indices = library_provider::GuestIndices::new(&invocation.component)?;
+                let guest = indices.load(&mut invocation.store, &invocation.instance)?;
+                guest
+                    .call_authenticate(&mut invocation.store, &account_id, credential.as_deref())
+                    .await
+            })
+        })
         .await
-        .map_err(|e| e.to_string())?;
-    let guest = indices
-        .load(&mut invocation.store, &invocation.instance)
-        .map_err(|e| e.to_string())?;
-    guest
-        .call_authenticate(&mut invocation.store, account_id, credential)
-        .await
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
 }
 
 pub async fn list_games(
@@ -104,16 +105,19 @@ pub async fn list_games(
     account_id: &str,
     access: &[u8],
 ) -> Result<Vec<OwnedGame>> {
-    let component = &plugin.component;
-    let indices = library_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
-    let mut invocation = Invocation::new(component)
+    let account_id = account_id.to_owned();
+    let access = access.to_vec();
+    plugin
+        .worker
+        .call(move |invocation| {
+            Box::pin(async move {
+                let indices = library_provider::GuestIndices::new(&invocation.component)?;
+                let guest = indices.load(&mut invocation.store, &invocation.instance)?;
+                guest
+                    .call_list_games(&mut invocation.store, &account_id, &access)
+                    .await
+            })
+        })
         .await
-        .map_err(|e| e.to_string())?;
-    let guest = indices
-        .load(&mut invocation.store, &invocation.instance)
-        .map_err(|e| e.to_string())?;
-    guest
-        .call_list_games(&mut invocation.store, account_id, access)
-        .await
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
 }

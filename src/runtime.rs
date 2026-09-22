@@ -1,7 +1,11 @@
+use std::{future::Future, pin::Pin};
+
+use tokio::sync::{mpsc, oneshot};
 use wasmtime::{
     Engine, Store,
     component::{Component, Instance, InstancePre, Linker, ResourceTable},
 };
+use wasmtime_wasi::runtime::{AbortOnDropJoinHandle, spawn};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{
     WasiHttpCtx,
@@ -38,7 +42,7 @@ impl Runtime {
     }
 }
 
-/// Per-invocation host resources; adapters place their explicit capabilities in the table.
+/// Resources owned by one loaded plugin runtime.
 pub(crate) struct HostState {
     pub(crate) table: ResourceTable,
     wasi: WasiCtx,
@@ -66,23 +70,84 @@ impl WasiHttpView for HostState {
 
 const INVOCATION_FUEL: u64 = 1_000_000_000;
 const YIELD_INTERVAL: u64 = 100_000;
-/// The Store and component instance owned by one independent call.
+type CallFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+type Call = Box<dyn for<'a> FnOnce(&'a mut Invocation) -> CallFuture<'a, bool> + Send>;
+
+/// One serialized worker. Its owner retains the task; the task never retains its owner.
+pub(crate) struct Worker {
+    sender: mpsc::UnboundedSender<Call>,
+    _task: AbortOnDropJoinHandle<()>,
+}
+
+impl Worker {
+    pub(crate) async fn new(pre: InstancePre<HostState>) -> Result<Self> {
+        let mut invocation = Invocation::new(pre).await?;
+        let (sender, mut receiver) = mpsc::unbounded_channel::<Call>();
+        // ponytail: one queue serializes every capability; split only for a concrete concurrency need.
+        let task = spawn(async move {
+            while let Some(call) = receiver.recv().await {
+                if !call(&mut invocation).await {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            sender,
+            _task: task,
+        })
+    }
+
+    pub(crate) async fn call<T, F>(&self, call: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(&'a mut Invocation) -> CallFuture<'a, wasmtime::Result<T>>
+            + Send
+            + 'static,
+    {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(Box::new(move |invocation| {
+                Box::pin(async move {
+                    let result = async {
+                        invocation.store.set_fuel(INVOCATION_FUEL)?;
+                        call(invocation).await
+                    }
+                    .await;
+                    // WIT errors are values inside Ok; only runtime failures retire the Store.
+                    let reusable = result.is_ok();
+                    let _ = reply.send(result);
+                    reusable
+                })
+            }))
+            .map_err(|_| wasmtime::Error::msg("plugin worker stopped; reload the plugin"))?;
+        Ok(response
+            .await
+            .map_err(|_| wasmtime::Error::msg("plugin worker stopped before replying"))??)
+    }
+}
+
+/// The persistent Store and instance, accessed only by their worker.
 pub(crate) struct Invocation {
+    pub(crate) component: InstancePre<HostState>,
     pub(crate) store: Store<HostState>,
     pub(crate) instance: Instance,
 }
 
 impl Invocation {
-    pub(crate) async fn new(pre: &InstancePre<HostState>) -> Result<Self> {
+    async fn new(pre: InstancePre<HostState>) -> Result<Self> {
         let state = HostState {
             table: ResourceTable::new(),
-            wasi: WasiCtxBuilder::new().build(),
+            wasi: WasiCtxBuilder::new().inherit_stderr().build(),
             http: WasiHttpCtx::new(),
         };
         let mut store = Store::new(pre.engine(), state);
         store.set_fuel(INVOCATION_FUEL)?;
         store.fuel_async_yield_interval(Some(YIELD_INTERVAL))?;
         let instance = pre.instantiate_async(&mut store).await?;
-        Ok(Self { store, instance })
+        Ok(Self {
+            component: pre,
+            store,
+            instance,
+        })
     }
 }

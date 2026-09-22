@@ -11,7 +11,7 @@ mod interfaces {
 pub use interfaces::PluginInterface;
 pub use manifest::{PluginManifest, parse_manifest};
 pub use packages::{LoadedPlugin, Plugins};
-pub(crate) use runtime::{HostState, Invocation, Runtime};
+pub(crate) use runtime::{HostState, Runtime};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {

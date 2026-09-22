@@ -5,23 +5,25 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
-use crate::{HostState, PluginError, PluginInfo, Result, Runtime, parse_manifest};
+use crate::{PluginError, PluginInfo, Result, Runtime, parse_manifest, runtime::Worker};
 
-use wasmtime::component::{Component, InstancePre, types::ComponentItem};
+use wasmtime::component::{Component, types::ComponentItem};
 
-/// Captured metadata and code from one installed revision.
+/// Captured metadata and a shared persistent runtime from one installed revision.
+/// Calls are serialized; explicit reload creates a new runtime without changing old handles.
 #[derive(Clone)]
 pub struct LoadedPlugin {
     pub info: PluginInfo,
-    pub(crate) component: InstancePre<HostState>,
+    pub(crate) worker: Arc<Worker>,
 }
 
 struct InstalledPlugin {
     info: PluginInfo,
     component: Option<Component>,
+    loaded: Arc<OnceCell<LoadedPlugin>>,
 }
 
 /// A shared package catalog. Installed revisions are immutable; compilation is lazy.
@@ -56,6 +58,7 @@ impl Plugins {
                             InstalledPlugin {
                                 info,
                                 component: None,
+                                loaded: Arc::new(OnceCell::new()),
                             },
                         )
                     })
@@ -83,16 +86,23 @@ impl Plugins {
     }
 
     pub async fn load(&self, id: &str) -> Result<LoadedPlugin> {
-        {
+        self.load_runtime(id, false).await
+    }
+
+    /// Start a new runtime for the installed revision, retaining any previously captured handles.
+    /// This changes neither the package files nor the persisted catalog.
+    pub async fn reload(&self, id: &str) -> Result<LoadedPlugin> {
+        self.load_runtime(id, true).await
+    }
+
+    async fn load_runtime(&self, id: &str, reload: bool) -> Result<LoadedPlugin> {
+        if !reload {
             let installed = self.installed.read().unwrap();
             let entry = installed
                 .get(id)
                 .ok_or_else(|| PluginError::NotFound(id.into()))?;
-            if let Some(component) = &entry.component {
-                return Ok(LoadedPlugin {
-                    info: entry.info.clone(),
-                    component: self.runtime.link(component)?,
-                });
+            if let Some(loaded) = entry.loaded.get() {
+                return Ok(loaded.clone());
             }
         }
         let publication = self.lifecycle.lock().await;
@@ -103,27 +113,36 @@ impl Plugins {
                 .ok_or_else(|| PluginError::NotFound(id.into()))?;
             (entry.info.clone(), entry.component.clone())
         };
-        if let Some(component) = cached {
-            drop(publication);
-            return Ok(LoadedPlugin {
-                info,
-                component: self.runtime.link(&component)?,
-            });
-        }
-        let bytes =
-            async_fs::read(self.revision_directory(info.revision).join("plugin.wasm")).await?;
-        let component = self.runtime.compile(bytes).await?;
-        self.installed
-            .write()
-            .unwrap()
-            .get_mut(id)
-            .unwrap()
-            .component = Some(component.clone());
+        let component = match cached {
+            Some(component) => component,
+            None => {
+                let bytes =
+                    async_fs::read(self.revision_directory(info.revision).join("plugin.wasm"))
+                        .await?;
+                self.runtime.compile(bytes).await?
+            }
+        };
+        let pre = self.runtime.link(&component)?;
+        let loaded = {
+            let mut installed = self.installed.write().unwrap();
+            let entry = installed.get_mut(id).unwrap();
+            entry.component = Some(component);
+            if reload {
+                entry.loaded = Arc::new(OnceCell::new());
+            }
+            entry.loaded.clone()
+        };
         drop(publication);
-        Ok(LoadedPlugin {
-            info,
-            component: self.runtime.link(&component)?,
-        })
+        // Guest initialization may perform I/O; it must not hold package publication locks.
+        loaded
+            .get_or_try_init(|| async {
+                Ok(LoadedPlugin {
+                    info,
+                    worker: Arc::new(Worker::new(pre).await?),
+                })
+            })
+            .await
+            .cloned()
     }
 
     /// Compile and inspect a revision without resolving application imports or running guest code.
@@ -153,6 +172,7 @@ impl Plugins {
                 Some(InstalledPlugin {
                     info: info.clone(),
                     component: Some(component),
+                    loaded: Arc::new(OnceCell::new()),
                 }),
             )
             .await
