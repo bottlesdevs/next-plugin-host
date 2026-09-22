@@ -1,6 +1,10 @@
 mod manifest;
 mod packages;
 mod runtime;
+pub mod storefront;
+pub use storefront::{
+    AccountIdentity, Authentication, LinkedAccount, OwnedGame, add_plugin_imports,
+};
 
 mod interfaces {
     include!(concat!(env!("OUT_DIR"), "/plugin_interfaces.rs"));
@@ -44,3 +48,13 @@ impl PluginInfo {
 }
 
 pub type Result<T> = std::result::Result<T, PluginError>;
+
+/// Input capability supplied by the application to one account-link invocation.
+#[async_trait::async_trait]
+pub trait AccountLinkInteraction: Send + Sync {
+    async fn request_input(
+        &self,
+        url: url::Url,
+        instructions: String,
+    ) -> std::result::Result<String, String>;
+}
