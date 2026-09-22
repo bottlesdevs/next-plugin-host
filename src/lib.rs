@@ -35,7 +35,7 @@ pub enum PluginError {
 pub struct PluginInfo {
     pub(crate) revision: uuid::Uuid,
     pub manifest: PluginManifest,
-    pub interfaces: Vec<String>,
+    pub(crate) interfaces: Vec<String>,
 }
 
 impl PluginInfo {

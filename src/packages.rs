@@ -16,7 +16,7 @@ use wasmtime::component::{Component, InstancePre, types::ComponentItem};
 #[derive(Clone)]
 pub struct LoadedPlugin {
     pub info: PluginInfo,
-    pub component: InstancePre<HostState>,
+    pub(crate) component: InstancePre<HostState>,
 }
 
 struct InstalledPlugin {

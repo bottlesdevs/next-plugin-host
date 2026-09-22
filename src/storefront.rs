@@ -1,7 +1,7 @@
 use crate::AccountLinkInteraction;
-use crate::{HostState, Invocation};
+use crate::{HostState, Invocation, LoadedPlugin};
 use std::sync::Arc;
-use wasmtime::component::{HasSelf, InstancePre, Linker, Resource};
+use wasmtime::component::{HasSelf, Linker, Resource};
 
 mod bindings {
     pub type AccountLinkInteractionResource = Arc<dyn super::AccountLinkInteraction>;
@@ -53,9 +53,10 @@ impl account_link::HostInteraction for HostState {
 impl account_link::Host for HostState {}
 
 pub async fn link_account(
-    component: &InstancePre<HostState>,
+    plugin: &LoadedPlugin,
     interaction: Arc<dyn AccountLinkInteraction>,
 ) -> Result<LinkedAccount> {
+    let component = &plugin.component;
     let indices = storefront_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
     let mut invocation = Invocation::new(component)
         .await
@@ -77,10 +78,11 @@ pub async fn link_account(
 }
 
 pub async fn authenticate(
-    component: &InstancePre<HostState>,
+    plugin: &LoadedPlugin,
     account_id: &str,
     credential: Option<&[u8]>,
 ) -> Result<Authentication> {
+    let component = &plugin.component;
     let indices = storefront_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
     let mut invocation = Invocation::new(component)
         .await
@@ -95,10 +97,11 @@ pub async fn authenticate(
 }
 
 pub async fn list_games(
-    component: &InstancePre<HostState>,
+    plugin: &LoadedPlugin,
     account_id: &str,
     access: &[u8],
 ) -> Result<Vec<OwnedGame>> {
+    let component = &plugin.component;
     let indices = storefront_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
     let mut invocation = Invocation::new(component)
         .await
