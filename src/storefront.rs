@@ -1,6 +1,6 @@
 use crate::runtime::{HostState, Invocation};
 use crate::{
-    AccountLinkInteraction, CompiledPlugin, LinkedAccount, ListedGames, Result,
+    AccountLinkInteraction, Authentication, CompiledPlugin, LinkedAccount, OwnedGame, Result,
     bindings::{bottles::plugin::account_link, exports::bottles::plugin::storefront_provider},
 };
 use std::sync::Arc;
@@ -71,11 +71,11 @@ pub async fn link_account(
         .ok_or_else(|| "account linking cancelled".to_owned())?
 }
 
-pub async fn list_games(
+pub async fn authenticate(
     component: &CompiledPlugin,
     account_id: &str,
     credential: Option<&[u8]>,
-) -> Result<ListedGames> {
+) -> Result<Authentication> {
     let pre = bind(component)?;
     let indices = storefront_provider::GuestIndices::new(&pre).map_err(|e| e.to_string())?;
     let mut invocation = Invocation::new(&pre).await?;
@@ -83,7 +83,31 @@ pub async fn list_games(
         .load(&mut invocation.store, &invocation.instance)
         .map_err(|e| e.to_string())?;
     guest
-        .call_list_games(&mut invocation.store, account_id, credential)
+        .call_authenticate(&mut invocation.store, account_id, credential)
         .await
         .map_err(|e| e.to_string())?
+}
+
+pub async fn list_games(
+    component: &CompiledPlugin,
+    account_id: &str,
+    access: &[u8],
+    cancellation: &CancellationToken,
+) -> Result<Vec<OwnedGame>> {
+    cancellation
+        .run_until_cancelled(async {
+            let pre = bind(component)?;
+            let indices =
+                storefront_provider::GuestIndices::new(&pre).map_err(|e| e.to_string())?;
+            let mut invocation = Invocation::new(&pre).await?;
+            let guest = indices
+                .load(&mut invocation.store, &invocation.instance)
+                .map_err(|e| e.to_string())?;
+            guest
+                .call_list_games(&mut invocation.store, account_id, access)
+                .await
+                .map_err(|e| e.to_string())?
+        })
+        .await
+        .ok_or_else(|| "library enumeration cancelled".to_owned())?
 }

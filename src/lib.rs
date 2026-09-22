@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use url::Url;
 
 pub use bindings::exports::bottles::plugin::storefront_provider::{
-    AccountIdentity, LinkedAccount, ListedGames, OwnedGame,
+    AccountIdentity, Authentication, LinkedAccount, OwnedGame,
 };
 pub use inspection::exported_interfaces;
 pub use interfaces::PluginInterface;
