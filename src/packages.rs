@@ -80,30 +80,38 @@ impl Plugins {
     }
 
     pub async fn load(&self, id: &str) -> Result<LoadedPlugin> {
-        let _lifecycle = self.lifecycle.lock().await;
-        let (info, component) = {
+        {
+            let installed = self.installed.read().unwrap();
+            let entry = installed
+                .get(id)
+                .ok_or_else(|| PluginError::NotFound(id.into()))?;
+            if let Some(component) = &entry.component {
+                return Ok(LoadedPlugin {
+                    info: entry.info.clone(),
+                    component: component.clone(),
+                });
+            }
+        }
+        let publication = self.lifecycle.lock().await;
+        let (info, cached) = {
             let installed = self.installed.read().unwrap();
             let entry = installed
                 .get(id)
                 .ok_or_else(|| PluginError::NotFound(id.into()))?;
             (entry.info.clone(), entry.component.clone())
         };
-        let component = match component {
-            Some(component) => component,
-            None => {
-                let bytes =
-                    async_fs::read(self.revision_directory(info.revision).join("plugin.wasm"))
-                        .await?;
-                let component = self.runtime.prepare(bytes).await?;
-                self.installed
-                    .write()
-                    .unwrap()
-                    .get_mut(id)
-                    .unwrap()
-                    .component = Some(component.clone());
-                component
-            }
-        };
+        if let Some(component) = cached {
+            return Ok(LoadedPlugin { info, component });
+        }
+        let bytes =
+            async_fs::read(self.revision_directory(info.revision).join("plugin.wasm")).await?;
+        drop(publication);
+        let component = self.runtime.prepare(bytes).await?;
+        if let Some(entry) = self.installed.write().unwrap().get_mut(id)
+            && entry.info.revision == info.revision
+        {
+            entry.component = Some(component.clone());
+        }
         Ok(LoadedPlugin { info, component })
     }
 
