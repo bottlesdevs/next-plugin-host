@@ -5,15 +5,16 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use tokio::sync::{Mutex, OnceCell};
+use futures::StreamExt;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{PluginError, PluginInfo, Result, Runtime, parse_manifest, runtime::Worker};
 
 use wasmtime::component::{Component, types::ComponentItem};
 
-/// Captured metadata and a shared persistent runtime from one installed revision.
-/// Calls are serialized; explicit reload creates a new runtime without changing old handles.
+/// Captured metadata and a shared persistent runtime for one installed plugin.
+/// Calls are serialized; retired handles reject new calls and never change instance identity.
 #[derive(Clone)]
 pub struct LoadedPlugin {
     pub info: PluginInfo,
@@ -23,47 +24,64 @@ pub struct LoadedPlugin {
 struct InstalledPlugin {
     info: PluginInfo,
     component: Option<Component>,
-    loaded: Arc<OnceCell<LoadedPlugin>>,
+    loaded: Option<LoadedPlugin>,
 }
 
-/// A shared package catalog. Installed revisions are immutable; compilation is lazy.
+impl Drop for InstalledPlugin {
+    fn drop(&mut self) {
+        if let Some(plugin) = &self.loaded {
+            plugin.worker.sender.close_channel();
+        }
+    }
+}
+
+/// A shared catalog of packages in `installed/<plugin-id>`. Compilation is lazy.
 /// Open one catalog per root and share its `Arc`; independent writers are unsupported.
 /// Callers must await mutations to finish publication and cleanup. Dropping a future
-/// abandons remaining work and does not roll back an already published revision.
+/// abandons remaining work. Failed replacement after removal may require reinstalling.
+/// Dropping the last catalog owner retires its runtimes, including retained loaded handles.
+/// Runtime startup and package publication are serialized; calls to loaded plugins remain independent.
 pub struct Plugins {
     root: PathBuf,
+    staging_root: PathBuf,
     runtime: Runtime,
     installed: RwLock<BTreeMap<String, InstalledPlugin>>,
     lifecycle: Mutex<()>,
 }
 
 impl Plugins {
-    pub async fn open(root: impl AsRef<Path>) -> Result<Arc<Self>> {
+    /// Scan installed metadata. Staging and installation must share a filesystem for rename.
+    pub async fn open(root: impl AsRef<Path>, staging_root: impl AsRef<Path>) -> Result<Arc<Self>> {
         let root = root.as_ref().to_owned();
-        let index: BTreeMap<String, PluginInfo> =
-            match async_fs::read_to_string(root.join("installed.toml")).await {
-                Ok(source) => toml::from_str(&source)?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
-                Err(error) => return Err(error.into()),
-            };
+        let mut installed = BTreeMap::new();
+        match async_fs::read_dir(root.join("installed")).await {
+            Ok(mut directories) => {
+                while let Some(directory) = directories.next().await {
+                    let directory = directory?;
+                    if !directory.file_type().await?.is_dir() {
+                        continue;
+                    }
+                    let info: PluginInfo = toml::from_str(
+                        &async_fs::read_to_string(directory.path().join("plugin.toml")).await?,
+                    )?;
+                    installed.insert(
+                        info.manifest.id.clone(),
+                        InstalledPlugin {
+                            info,
+                            component: None,
+                            loaded: None,
+                        },
+                    );
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(Arc::new(Self {
             root,
+            staging_root: staging_root.as_ref().to_owned(),
             runtime: Runtime::new()?,
-            installed: RwLock::new(
-                index
-                    .into_iter()
-                    .map(|(id, info)| {
-                        (
-                            id,
-                            InstalledPlugin {
-                                info,
-                                component: None,
-                                loaded: Arc::new(OnceCell::new()),
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
+            installed: RwLock::new(installed),
             lifecycle: Mutex::new(()),
         }))
     }
@@ -89,8 +107,8 @@ impl Plugins {
         self.load_runtime(id, false).await
     }
 
-    /// Start a new runtime for the installed revision, retaining any previously captured handles.
-    /// This changes neither the package files nor the persisted catalog.
+    /// Retire the current runtime and start a replacement using the installed code.
+    /// This changes no package files.
     pub async fn reload(&self, id: &str) -> Result<LoadedPlugin> {
         self.load_runtime(id, true).await
     }
@@ -101,54 +119,56 @@ impl Plugins {
             let entry = installed
                 .get(id)
                 .ok_or_else(|| PluginError::NotFound(id.into()))?;
-            if let Some(loaded) = entry.loaded.get() {
+            if let Some(loaded) = &entry.loaded {
                 return Ok(loaded.clone());
             }
         }
-        let publication = self.lifecycle.lock().await;
+        let _lifecycle = self.lifecycle.lock().await;
         let (info, cached) = {
             let installed = self.installed.read().unwrap();
             let entry = installed
                 .get(id)
                 .ok_or_else(|| PluginError::NotFound(id.into()))?;
+            if !reload && let Some(loaded) = &entry.loaded {
+                return Ok(loaded.clone());
+            }
             (entry.info.clone(), entry.component.clone())
         };
         let component = match cached {
             Some(component) => component,
             None => {
-                let bytes =
-                    async_fs::read(self.revision_directory(info.revision).join("plugin.wasm"))
-                        .await?;
+                let bytes = async_fs::read(self.directory(id).join("plugin.wasm")).await?;
                 self.runtime.compile(bytes).await?
             }
         };
         let pre = self.runtime.link(&component)?;
-        let loaded = {
+        {
             let mut installed = self.installed.write().unwrap();
             let entry = installed.get_mut(id).unwrap();
-            entry.component = Some(component);
             if reload {
-                entry.loaded = Arc::new(OnceCell::new());
+                *entry = InstalledPlugin {
+                    info: info.clone(),
+                    component: Some(component),
+                    loaded: None,
+                };
+            } else {
+                entry.component = Some(component);
             }
-            entry.loaded.clone()
+        }
+        let plugin = LoadedPlugin {
+            info,
+            worker: Arc::new(Worker::new(pre).await?),
         };
-        drop(publication);
-        // Guest initialization may perform I/O; it must not hold package publication locks.
-        loaded
-            .get_or_try_init(|| async {
-                Ok(LoadedPlugin {
-                    info,
-                    worker: Arc::new(Worker::new(pre).await?),
-                })
-            })
-            .await
-            .cloned()
+        self.installed.write().unwrap().get_mut(id).unwrap().loaded = Some(plugin.clone());
+        Ok(plugin)
     }
 
-    /// Compile and inspect a revision without resolving application imports or running guest code.
+    /// Prepare a complete package without running guest code, then replace its installed directory.
+    /// Preparation failures preserve the old installation; replacement failures may require reinstalling.
     pub async fn install(&self, source: &Path) -> Result<PluginInfo> {
         let manifest =
             parse_manifest(&async_fs::read_to_string(source.join("plugin.toml")).await?)?;
+        let directory = self.directory(&manifest.id);
         let bytes = async_fs::read(source.join("plugin.wasm")).await?;
         let component = self.runtime.compile(bytes.clone()).await?;
         let interfaces = component
@@ -160,98 +180,59 @@ impl Plugins {
         let info = PluginInfo {
             manifest,
             interfaces,
-            revision: Uuid::new_v4(),
         };
-        let publication = self.lifecycle.lock().await;
-        let directory = self.revision_directory(info.revision);
+        let workspace = self.staging_root.join(Uuid::new_v4().to_string());
+        async_fs::create_dir_all(&workspace).await?;
         let result = async {
-            async_fs::create_dir_all(&directory).await?;
-            async_fs::write(directory.join("plugin.wasm"), bytes).await?;
-            self.publish(
-                &info.manifest.id,
-                Some(InstalledPlugin {
+            async_fs::write(workspace.join("plugin.wasm"), bytes).await?;
+            async_fs::write(
+                workspace.join("plugin.toml"),
+                toml::to_string_pretty(&info)?,
+            )
+            .await?;
+            async_fs::create_dir_all(self.root.join("installed")).await?;
+            let _publication = self.lifecycle.lock().await;
+            let mut installed = self.installed.write().unwrap();
+            // Retire, remove, rename and publish without yielding after withdrawal begins.
+            drop(installed.remove(&info.manifest.id));
+            remove_directory(&directory)?;
+            std::fs::rename(&workspace, &directory)?;
+            installed.insert(
+                info.manifest.id.clone(),
+                InstalledPlugin {
                     info: info.clone(),
                     component: Some(component),
-                    loaded: Arc::new(OnceCell::new()),
-                }),
-            )
-            .await
-        }
-        .await;
-        drop(publication);
-        match result {
-            Ok(old) => {
-                if let Some(old) = old {
-                    self.cleanup(old.revision).await;
-                }
-                Ok(info)
-            }
-            Err(error) => {
-                self.cleanup(info.revision).await;
-                Err(error)
-            }
-        }
-    }
-
-    /// Remove catalog membership. Already captured revisions may finish their work.
-    pub async fn uninstall(&self, id: &str) -> Result<()> {
-        let publication = self.lifecycle.lock().await;
-        let old = self.publish(id, None).await?;
-        drop(publication);
-        if let Some(old) = old {
-            self.cleanup(old.revision).await;
-        }
-        Ok(())
-    }
-
-    // Caller holds the publication guard through disk and memory changes.
-    async fn publish(
-        &self,
-        id: &str,
-        entry: Option<InstalledPlugin>,
-    ) -> Result<Option<PluginInfo>> {
-        let mut index: BTreeMap<String, PluginInfo> = self
-            .installed
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(id, entry)| (id.clone(), entry.info.clone()))
-            .collect();
-        match &entry {
-            Some(entry) => {
-                index.insert(id.into(), entry.info.clone());
-            }
-            None => {
-                index.remove(id);
-            }
-        }
-        async_fs::create_dir_all(&self.root).await?;
-        let temporary = self.root.join(format!("installed-{}.tmp", Uuid::new_v4()));
-        let result = async {
-            async_fs::write(&temporary, toml::to_string_pretty(&index)?).await?;
-            // No await between the disk commit and publishing the same state in memory.
-            std::fs::rename(&temporary, self.root.join("installed.toml"))?;
-            let mut installed = self.installed.write().unwrap();
-            let old = match entry {
-                Some(entry) => installed.insert(id.into(), entry),
-                None => installed.remove(id),
-            };
-            Ok(old.map(|entry| entry.info))
+                    loaded: None,
+                },
+            );
+            Ok(info)
         }
         .await;
         if result.is_err() {
-            let _ = async_fs::remove_file(temporary).await;
+            let _ = async_fs::remove_dir_all(&workspace).await;
         }
         result
     }
 
-    fn revision_directory(&self, revision: Uuid) -> PathBuf {
-        self.root.join("revisions").join(revision.to_string())
+    /// Remove catalog membership and retire the runtime. Already accepted calls may finish.
+    pub async fn uninstall(&self, id: &str) -> Result<()> {
+        let directory = self.directory(id);
+        let _publication = self.lifecycle.lock().await;
+        let mut installed = self.installed.write().unwrap();
+        drop(installed.remove(id));
+        remove_directory(&directory)?;
+        Ok(())
     }
 
-    async fn cleanup(&self, revision: Uuid) {
-        if let Err(error) = async_fs::remove_dir_all(self.revision_directory(revision)).await {
-            tracing::warn!(%revision, %error, "failed to remove obsolete plugin revision");
-        }
+    fn directory(&self, id: &str) -> PathBuf {
+        self.root.join("installed").join(id)
+    }
+}
+
+fn remove_directory(path: &Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }

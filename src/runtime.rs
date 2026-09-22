@@ -1,6 +1,7 @@
 use std::{future::Future, pin::Pin};
 
-use tokio::sync::{mpsc, oneshot};
+use futures::{StreamExt, channel::mpsc};
+use tokio::sync::oneshot;
 use wasmtime::{
     Engine, Store,
     component::{Component, Instance, InstancePre, Linker, ResourceTable},
@@ -75,17 +76,17 @@ type Call = Box<dyn for<'a> FnOnce(&'a mut Invocation) -> CallFuture<'a, bool> +
 
 /// One serialized worker. Its owner retains the task; the task never retains its owner.
 pub(crate) struct Worker {
-    sender: mpsc::UnboundedSender<Call>,
+    pub(super) sender: mpsc::UnboundedSender<Call>,
     _task: AbortOnDropJoinHandle<()>,
 }
 
 impl Worker {
     pub(crate) async fn new(pre: InstancePre<HostState>) -> Result<Self> {
-        let mut invocation = Invocation::new(pre).await?;
-        let (sender, mut receiver) = mpsc::unbounded_channel::<Call>();
+        let mut invocation = spawn(Invocation::new(pre)).await?;
+        let (sender, mut receiver) = mpsc::unbounded::<Call>();
         // ponytail: one queue serializes every capability; split only for a concrete concurrency need.
         let task = spawn(async move {
-            while let Some(call) = receiver.recv().await {
+            while let Some(call) = receiver.next().await {
                 if !call(&mut invocation).await {
                     break;
                 }
@@ -106,7 +107,7 @@ impl Worker {
     {
         let (reply, response) = oneshot::channel();
         self.sender
-            .send(Box::new(move |invocation| {
+            .unbounded_send(Box::new(move |invocation| {
                 Box::pin(async move {
                     let result = async {
                         invocation.store.set_fuel(INVOCATION_FUEL)?;

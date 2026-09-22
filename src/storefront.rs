@@ -63,8 +63,12 @@ pub async fn link_account(
         .worker
         .call(move |invocation| {
             Box::pin(async move {
-                let indices = account_provider::GuestIndices::new(&invocation.component)?;
-                let guest = indices.load(&mut invocation.store, &invocation.instance)?;
+                let guest = match account_provider::GuestIndices::new(&invocation.component)
+                    .and_then(|indices| indices.load(&mut invocation.store, &invocation.instance))
+                {
+                    Ok(guest) => guest,
+                    Err(error) => return Ok(Err(error.to_string())),
+                };
                 let interaction = invocation.store.data_mut().table.push(interaction)?;
                 let borrowed = Resource::new_borrow(interaction.rep());
                 let result = guest
@@ -89,8 +93,12 @@ pub async fn authenticate(
         .worker
         .call(move |invocation| {
             Box::pin(async move {
-                let indices = library_provider::GuestIndices::new(&invocation.component)?;
-                let guest = indices.load(&mut invocation.store, &invocation.instance)?;
+                let guest = match library_provider::GuestIndices::new(&invocation.component)
+                    .and_then(|indices| indices.load(&mut invocation.store, &invocation.instance))
+                {
+                    Ok(guest) => guest,
+                    Err(error) => return Ok(Err(error.to_string())),
+                };
                 guest
                     .call_authenticate(&mut invocation.store, &account_id, credential.as_deref())
                     .await
@@ -111,8 +119,12 @@ pub async fn list_games(
         .worker
         .call(move |invocation| {
             Box::pin(async move {
-                let indices = library_provider::GuestIndices::new(&invocation.component)?;
-                let guest = indices.load(&mut invocation.store, &invocation.instance)?;
+                let guest = match library_provider::GuestIndices::new(&invocation.component)
+                    .and_then(|indices| indices.load(&mut invocation.store, &invocation.instance))
+                {
+                    Ok(guest) => guest,
+                    Err(error) => return Ok(Err(error.to_string())),
+                };
                 guest
                     .call_list_games(&mut invocation.store, &account_id, &access)
                     .await

@@ -15,10 +15,8 @@ pub(crate) use runtime::{HostState, Runtime};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
-    #[error("failed to serialize package index: {0}")]
-    SerializeIndex(#[from] toml::ser::Error),
-    #[error("plugin manifest schema {0} is not supported")]
-    UnsupportedSchema(u32),
+    #[error("failed to serialize plugin metadata: {0}")]
+    SerializeMetadata(#[from] toml::ser::Error),
     #[error("failed to parse plugin metadata: {0}")]
     ParseMetadata(#[from] toml::de::Error),
     #[error("plugin {0} was not found")]
@@ -31,7 +29,7 @@ pub enum PluginError {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PluginInfo {
-    pub(crate) revision: uuid::Uuid,
+    #[serde(flatten)]
     pub manifest: PluginManifest,
     pub(crate) interfaces: Vec<String>,
 }
