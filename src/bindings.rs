@@ -2,7 +2,7 @@ pub type AccountLinkInteractionResource = std::sync::Arc<dyn crate::AccountLinkI
 
 wasmtime::component::bindgen!({
     path: "../next-plugin-api/wit",
-    world: "plugin",
+    world: "storefront",
     imports: { default: async | trappable },
     exports: { default: async },
     with: {

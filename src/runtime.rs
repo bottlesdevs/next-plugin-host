@@ -1,10 +1,6 @@
-use std::sync::Arc;
-
-use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
 use wasmtime::{
     Engine, Store,
-    component::{Component, HasSelf, Linker, Resource, ResourceAny, ResourceTable},
+    component::{Component, Instance, InstancePre, Linker, ResourceTable},
 };
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{
@@ -12,25 +8,40 @@ use wasmtime_wasi_http::{
     p2::{WasiHttpCtxView, WasiHttpView},
 };
 
-use crate::{
-    AccountLinkInteraction, LinkedAccount, ListedGames, PluginKind, Result,
-    bindings::{self, bottles::plugin::account_link},
-};
+use crate::Result;
 
-/// One initialized WebAssembly component and its persistent plugin resource.
-pub struct Plugin {
-    provides: Vec<PluginKind>,
-    instance: Mutex<PluginInstance>,
+/// Shared compiler. Compiling a component does not instantiate or execute it.
+pub struct Runtime {
+    engine: Engine,
 }
 
-struct PluginInstance {
-    store: Store<HostState>,
-    guest: bindings::Plugin,
-    resource: ResourceAny,
+impl Runtime {
+    pub fn new() -> Result<Self> {
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        Ok(Self {
+            engine: Engine::new(&config).map_err(|e| e.to_string())?,
+        })
+    }
+
+    pub async fn compile(&self, bytes: Vec<u8>) -> Result<CompiledPlugin> {
+        let engine = self.engine.clone();
+        blocking::unblock(move || {
+            Component::from_binary(&engine, &bytes)
+                .map(|component| CompiledPlugin { component })
+                .map_err(|e| e.to_string())
+        })
+        .await
+    }
 }
 
-struct HostState {
-    table: ResourceTable,
+/// Immutable code shared by independent invocations and contribution adapters.
+pub struct CompiledPlugin {
+    pub(crate) component: Component,
+}
+
+pub(crate) struct HostState {
+    pub(crate) table: ResourceTable,
     wasi: WasiCtx,
     http: WasiHttpCtx,
 }
@@ -54,152 +65,40 @@ impl WasiHttpView for HostState {
     }
 }
 
-impl account_link::HostInteraction for HostState {
-    async fn request_input(
-        &mut self,
-        interaction: Resource<Arc<dyn AccountLinkInteraction>>,
-        url: String,
-        instructions: String,
-    ) -> wasmtime::Result<std::result::Result<String, String>> {
-        let interaction = self.table.get(&interaction)?.clone();
-        let url = match url::Url::parse(&url) {
-            Ok(url) => url,
-            Err(error) => return Ok(Err(format!("invalid interaction URL: {error}"))),
-        };
-        Ok(interaction.request_input(url, instructions).await)
-    }
-
-    async fn drop(
-        &mut self,
-        interaction: Resource<Arc<dyn AccountLinkInteraction>>,
-    ) -> wasmtime::Result<()> {
-        self.table.delete(interaction)?;
-        Ok(())
-    }
+const INVOCATION_FUEL: u64 = 1_000_000_000;
+const YIELD_INTERVAL: u64 = 100_000;
+/// The Store and component instance owned by one independent call.
+pub(crate) struct Invocation {
+    pub(crate) store: Store<HostState>,
+    pub(crate) instance: Instance,
 }
 
-impl account_link::Host for HostState {}
-
-impl Plugin {
-    /// Compiles and initializes one component with standard WASI and WASI HTTP.
-    pub async fn load(component: &[u8]) -> Result<Self> {
-        let engine = Engine::new(&wasmtime::Config::new()).map_err(|error| error.to_string())?;
-        let mut linker = Linker::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|error| error.to_string())?;
-        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
-            .map_err(|error| error.to_string())?;
-        account_link::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-            .map_err(|error| error.to_string())?;
-
-        let component =
-            Component::from_binary(&engine, component).map_err(|error| error.to_string())?;
+impl Invocation {
+    pub(crate) async fn new(pre: &InstancePre<HostState>) -> Result<Self> {
         let state = HostState {
             table: ResourceTable::new(),
             wasi: WasiCtxBuilder::new().build(),
             http: WasiHttpCtx::new(),
         };
-        let mut store = Store::new(&engine, state);
-        let guest = bindings::Plugin::instantiate_async(&mut store, &component, &linker)
-            .await
-            .map_err(|error| error.to_string())?;
-        let provides = guest
-            .bottles_plugin_lifecycle()
-            .call_provides(&mut store)
-            .await
-            .map_err(|error| error.to_string())?;
-        let resource = guest
-            .bottles_plugin_lifecycle()
-            .plugin()
-            .call_new(&mut store)
-            .await
-            .map_err(|error| error.to_string())??;
-
-        Ok(Self {
-            provides,
-            instance: Mutex::new(PluginInstance {
-                store,
-                guest,
-                resource,
-            }),
-        })
-    }
-
-    /// The typed subsystem contributions declared by the component.
-    pub fn provides(&self) -> &[PluginKind] {
-        &self.provides
-    }
-
-    /// Invokes the storefront account-provider contribution.
-    pub async fn link_account(
-        &self,
-        interaction: Arc<dyn AccountLinkInteraction>,
-        cancellation: &CancellationToken,
-    ) -> Result<LinkedAccount> {
-        if !self
-            .provides
-            .contains(&PluginKind::StorefrontAccountProvider)
-        {
-            return Err("plugin does not advertise storefront-account-provider".into());
-        }
-
-        let Some(mut instance) = cancellation.run_until_cancelled(self.instance.lock()).await
-        else {
-            return Err("account linking cancelled".into());
-        };
-        let PluginInstance {
-            store,
-            guest,
-            resource,
-        } = &mut *instance;
-
-        let interaction = store
-            .data_mut()
-            .table
-            .push(interaction)
-            .map_err(|error| error.to_string())?;
-        let borrowed_interaction = Resource::new_borrow(interaction.rep());
-        let result = cancellation
-            .run_until_cancelled(
-                guest
-                    .bottles_plugin_storefront_account_provider()
-                    .call_link_account(&mut *store, *resource, borrowed_interaction),
-            )
-            .await;
+        let mut store = Store::new(pre.engine(), state);
+        store.set_fuel(INVOCATION_FUEL).map_err(|e| e.to_string())?;
         store
-            .data_mut()
-            .table
-            .delete(interaction)
-            .map_err(|error| error.to_string())?;
-
-        result
-            .ok_or_else(|| "account linking cancelled".to_owned())?
-            .map_err(|error| error.to_string())?
-    }
-
-    /// Invokes the storefront library-provider contribution.
-    pub async fn list_games(
-        &self,
-        account_id: &str,
-        credential: Option<&[u8]>,
-    ) -> Result<ListedGames> {
-        if !self
-            .provides
-            .contains(&PluginKind::StorefrontLibraryProvider)
-        {
-            return Err("plugin does not advertise storefront-library-provider".into());
-        }
-
-        let mut instance = self.instance.lock().await;
-        let PluginInstance {
-            store,
-            guest,
-            resource,
-        } = &mut *instance;
-
-        guest
-            .bottles_plugin_storefront_library_provider()
-            .call_list_games(&mut *store, *resource, account_id, credential)
+            .fuel_async_yield_interval(Some(YIELD_INTERVAL))
+            .map_err(|e| e.to_string())?;
+        let instance = pre
+            .instantiate_async(&mut store)
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|e| e.to_string())?;
+        Ok(Self { store, instance })
+    }
+}
+
+impl CompiledPlugin {
+    pub(crate) fn linker(&self) -> Result<Linker<HostState>> {
+        let mut linker = Linker::new(self.component.engine());
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
+            .map_err(|e| e.to_string())?;
+        Ok(linker)
     }
 }

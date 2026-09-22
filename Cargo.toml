@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+wasmparser = "0.252"
+blocking.workspace = true
 serde.workspace = true
 semver.workspace = true
 thiserror.workspace = true
@@ -19,3 +21,7 @@ url = { workspace = true, features = ["serde"] }
 wasmtime = { version = "47", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation"] }
 wasmtime-wasi = { version = "47", default-features = false, features = ["p2"] }
 wasmtime-wasi-http = { version = "47", default-features = false, features = ["default-send-request", "p2"] }
+
+[build-dependencies]
+heck = "0.5"
+wit-parser = { version = "0.252", default-features = false, features = ["std"] }

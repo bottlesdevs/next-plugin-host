@@ -1,20 +1,28 @@
 mod bindings;
+mod inspection;
 mod manifest;
 mod runtime;
+pub mod storefront;
+
+mod interfaces {
+    include!(concat!(env!("OUT_DIR"), "/plugin_interfaces.rs"));
+}
 
 use async_trait::async_trait;
 use url::Url;
 
-pub use bindings::exports::bottles::plugin::{
-    lifecycle::PluginKind,
-    storefront_account_provider::{AccountIdentity, LinkedAccount},
-    storefront_library_provider::{ListedGames, OwnedGame},
+pub use bindings::exports::bottles::plugin::storefront_provider::{
+    AccountIdentity, LinkedAccount, ListedGames, OwnedGame,
 };
+pub use inspection::exported_interfaces;
+pub use interfaces::PluginInterface;
 pub use manifest::{PluginManifest, parse_manifest};
-pub use runtime::Plugin;
+pub use runtime::{CompiledPlugin, Runtime};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
+    #[error("invalid component: {0}")]
+    Component(#[from] wasmparser::BinaryReaderError),
     #[error("plugin manifest schema {0} is not supported")]
     UnsupportedSchema(u32),
     #[error("failed to parse plugin manifest: {0}")]
@@ -30,7 +38,16 @@ pub enum PluginError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PluginInfo {
     pub manifest: PluginManifest,
-    pub provides: Vec<PluginKind>,
+    pub interfaces: Vec<String>,
+}
+
+impl PluginInfo {
+    /// Reports export presence; typed binding checks compatibility on invocation.
+    pub fn exports(&self, interface: PluginInterface) -> bool {
+        self.interfaces
+            .iter()
+            .any(|name| name == interface.as_str())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, String>;
