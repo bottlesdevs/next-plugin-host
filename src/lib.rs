@@ -1,25 +1,17 @@
-mod bindings;
 mod inspection;
 mod manifest;
 mod packages;
 mod runtime;
-pub mod storefront;
 
 mod interfaces {
     include!(concat!(env!("OUT_DIR"), "/plugin_interfaces.rs"));
 }
 
-use async_trait::async_trait;
-use url::Url;
-
-pub use bindings::exports::bottles::plugin::storefront_provider::{
-    AccountIdentity, Authentication, LinkedAccount, OwnedGame,
-};
 pub use inspection::exported_interfaces;
 pub use interfaces::PluginInterface;
 pub use manifest::{PluginManifest, parse_manifest};
 pub use packages::{LoadedPlugin, Plugins};
-pub use runtime::{CompiledPlugin, Runtime};
+pub use runtime::{HostState, Invocation, Runtime};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
@@ -34,7 +26,7 @@ pub enum PluginError {
     #[error("plugin {0} was not found")]
     NotFound(String),
     #[error("plugin runtime failed: {0}")]
-    Runtime(String),
+    Runtime(#[from] wasmtime::Error),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -55,16 +47,4 @@ impl PluginInfo {
     }
 }
 
-pub type Result<T> = std::result::Result<T, String>;
-
-/// A host-owned interaction used by account-provider plugins to ask the user
-/// for a value, such as a browser callback URL or authorization code.
-/// The host parses the component's URL before invoking this callback.
-#[async_trait]
-pub trait AccountLinkInteraction: Send + Sync {
-    async fn request_input(
-        &self,
-        url: Url,
-        instructions: String,
-    ) -> std::result::Result<String, String>;
-}
+pub type Result<T> = std::result::Result<T, PluginError>;

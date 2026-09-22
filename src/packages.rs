@@ -11,21 +11,21 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    CompiledPlugin, PluginError, PluginInfo, Runtime, exported_interfaces, parse_manifest,
+    HostState, PluginError, PluginInfo, Result, Runtime, exported_interfaces, parse_manifest,
 };
 
-type Result<T> = std::result::Result<T, PluginError>;
+use wasmtime::component::InstancePre;
 
 /// Captured metadata and code from one installed revision.
 #[derive(Clone)]
 pub struct LoadedPlugin {
     pub info: PluginInfo,
-    pub component: Arc<CompiledPlugin>,
+    pub component: InstancePre<HostState>,
 }
 
 struct InstalledPlugin {
     info: PluginInfo,
-    component: Option<Arc<CompiledPlugin>>,
+    component: Option<InstancePre<HostState>>,
 }
 
 #[derive(Default, Serialize, Deserialize, Config)]
@@ -43,7 +43,7 @@ pub struct Plugins {
 }
 
 impl Plugins {
-    pub async fn open(root: impl AsRef<Path>) -> Result<Arc<Self>> {
+    pub async fn open(root: impl AsRef<Path>, runtime: Runtime) -> Result<Arc<Self>> {
         let root = root.as_ref().to_owned();
         let index: InstalledIndex = match next_config::load(root.join("installed.toml")).await {
             Ok(index) => index,
@@ -56,7 +56,7 @@ impl Plugins {
         };
         Ok(Arc::new(Self {
             root,
-            runtime: Runtime::new().map_err(PluginError::Runtime)?,
+            runtime,
             installed: RwLock::new(
                 index
                     .packages
@@ -108,12 +108,7 @@ impl Plugins {
                 let bytes =
                     async_fs::read(self.revision_directory(info.revision).join("plugin.wasm"))
                         .await?;
-                let component = Arc::new(
-                    self.runtime
-                        .compile(bytes)
-                        .await
-                        .map_err(PluginError::Runtime)?,
-                );
+                let component = self.runtime.prepare(bytes).await?;
                 self.installed
                     .write()
                     .unwrap()
