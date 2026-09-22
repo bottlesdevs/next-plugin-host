@@ -18,8 +18,12 @@ mod bindings {
     });
 }
 
-use bindings::{bottles::plugin::account_link, exports::bottles::plugin::storefront_provider};
-pub use storefront_provider::{AccountIdentity, Authentication, LinkedAccount, OwnedGame};
+pub use account_provider::{AccountIdentity, LinkedAccount};
+use bindings::{
+    bottles::plugin::account_link,
+    exports::bottles::plugin::{account_provider, library_provider},
+};
+pub use library_provider::{Authentication, OwnedGame};
 type Result<T> = std::result::Result<T, String>;
 
 /// Register storefront imports once when composing the application runtime.
@@ -57,7 +61,7 @@ pub async fn link_account(
     interaction: Arc<dyn AccountLinkInteraction>,
 ) -> Result<LinkedAccount> {
     let component = &plugin.component;
-    let indices = storefront_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
+    let indices = account_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
     let mut invocation = Invocation::new(component)
         .await
         .map_err(|e| e.to_string())?;
@@ -83,7 +87,7 @@ pub async fn authenticate(
     credential: Option<&[u8]>,
 ) -> Result<Authentication> {
     let component = &plugin.component;
-    let indices = storefront_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
+    let indices = library_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
     let mut invocation = Invocation::new(component)
         .await
         .map_err(|e| e.to_string())?;
@@ -102,7 +106,7 @@ pub async fn list_games(
     access: &[u8],
 ) -> Result<Vec<OwnedGame>> {
     let component = &plugin.component;
-    let indices = storefront_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
+    let indices = library_provider::GuestIndices::new(component).map_err(|e| e.to_string())?;
     let mut invocation = Invocation::new(component)
         .await
         .map_err(|e| e.to_string())?;
