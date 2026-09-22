@@ -10,6 +10,7 @@ mod bindings {
     wasmtime::component::bindgen!({
         path: "../next-plugin-api/wit",
         world: "storefront",
+        additional_derives: [serde::Serialize, serde::Deserialize, PartialEq, Eq],
         imports: { default: async | trappable },
         exports: { default: async },
         with: {
