@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{PluginError, PluginInfo, Result, Runtime, parse_manifest, runtime::Worker};
 
-use wasmtime::component::{Component, types::ComponentItem};
+use wasmtime::component::types::ComponentItem;
 
 /// Captured metadata and a shared persistent runtime for one installed plugin.
 /// Calls are serialized; retired handles reject new calls and never change instance identity.
@@ -23,7 +23,6 @@ pub struct LoadedPlugin {
 
 struct InstalledPlugin {
     info: PluginInfo,
-    component: Option<Component>,
     loaded: Option<LoadedPlugin>,
 }
 
@@ -66,11 +65,7 @@ impl Plugins {
                     )?;
                     installed.insert(
                         info.manifest.id.clone(),
-                        InstalledPlugin {
-                            info,
-                            component: None,
-                            loaded: None,
-                        },
+                        InstalledPlugin { info, loaded: None },
                     );
                 }
             }
@@ -124,7 +119,7 @@ impl Plugins {
             }
         }
         let _lifecycle = self.lifecycle.lock().await;
-        let (info, cached) = {
+        let info = {
             let installed = self.installed.read().unwrap();
             let entry = installed
                 .get(id)
@@ -132,28 +127,18 @@ impl Plugins {
             if !reload && let Some(loaded) = &entry.loaded {
                 return Ok(loaded.clone());
             }
-            (entry.info.clone(), entry.component.clone())
+            entry.info.clone()
         };
-        let component = match cached {
-            Some(component) => component,
-            None => {
-                let bytes = async_fs::read(self.directory(id).join("plugin.wasm")).await?;
-                self.runtime.compile(bytes).await?
-            }
-        };
+        let bytes = async_fs::read(self.directory(id).join("plugin.wasm")).await?;
+        let component = self.runtime.compile(bytes).await?;
         let pre = self.runtime.link(&component)?;
-        {
+        if reload {
             let mut installed = self.installed.write().unwrap();
             let entry = installed.get_mut(id).unwrap();
-            if reload {
-                *entry = InstalledPlugin {
-                    info: info.clone(),
-                    component: Some(component),
-                    loaded: None,
-                };
-            } else {
-                entry.component = Some(component);
-            }
+            *entry = InstalledPlugin {
+                info: info.clone(),
+                loaded: None,
+            };
         }
         let plugin = LoadedPlugin {
             info,
@@ -201,7 +186,6 @@ impl Plugins {
                 info.manifest.id.clone(),
                 InstalledPlugin {
                     info: info.clone(),
-                    component: Some(component),
                     loaded: None,
                 },
             );
