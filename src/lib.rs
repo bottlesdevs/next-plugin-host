@@ -2,9 +2,7 @@ mod manifest;
 mod packages;
 mod runtime;
 pub mod storefront;
-pub use storefront::{
-    AccountIdentity, Authentication, LinkedAccount, OwnedGame, add_plugin_imports,
-};
+pub use storefront::{AccountIdentity, Authentication, LinkedAccount, OwnedGame};
 
 mod interfaces {
     include!(concat!(env!("OUT_DIR"), "/plugin_interfaces.rs"));
@@ -13,7 +11,7 @@ mod interfaces {
 pub use interfaces::PluginInterface;
 pub use manifest::{PluginManifest, parse_manifest};
 pub use packages::{LoadedPlugin, Plugins};
-pub use runtime::{HostState, Invocation, Runtime};
+pub(crate) use runtime::{HostState, Invocation, Runtime};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {

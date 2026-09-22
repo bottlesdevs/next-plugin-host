@@ -26,8 +26,7 @@ use bindings::{
 pub use library_provider::{Authentication, OwnedGame};
 type Result<T> = std::result::Result<T, String>;
 
-/// Register storefront imports once when composing the application runtime.
-pub fn add_plugin_imports(linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
+pub(crate) fn add_plugin_imports(linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
     account_link::add_to_linker::<_, HasSelf<_>>(linker, |state| state)
 }
 

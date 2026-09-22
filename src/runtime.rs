@@ -11,22 +11,20 @@ use wasmtime_wasi_http::{
 use crate::Result;
 
 /// Shared compiler and the complete host import environment. Preparation executes no guest code.
-pub struct Runtime {
+pub(crate) struct Runtime {
     engine: Engine,
     linker: Linker<HostState>,
 }
 
 impl Runtime {
-    pub fn new(
-        register_imports: impl FnOnce(&mut Linker<HostState>) -> wasmtime::Result<()>,
-    ) -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
         let engine = Engine::new(&config)?;
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-        register_imports(&mut linker)?;
+        crate::storefront::add_plugin_imports(&mut linker)?;
         Ok(Self { engine, linker })
     }
 
@@ -41,8 +39,8 @@ impl Runtime {
 }
 
 /// Per-invocation host resources; adapters place their explicit capabilities in the table.
-pub struct HostState {
-    pub table: ResourceTable,
+pub(crate) struct HostState {
+    pub(crate) table: ResourceTable,
     wasi: WasiCtx,
     http: WasiHttpCtx,
 }
@@ -69,13 +67,13 @@ impl WasiHttpView for HostState {
 const INVOCATION_FUEL: u64 = 1_000_000_000;
 const YIELD_INTERVAL: u64 = 100_000;
 /// The Store and component instance owned by one independent call.
-pub struct Invocation {
-    pub store: Store<HostState>,
-    pub instance: Instance,
+pub(crate) struct Invocation {
+    pub(crate) store: Store<HostState>,
+    pub(crate) instance: Instance,
 }
 
 impl Invocation {
-    pub async fn new(pre: &InstancePre<HostState>) -> Result<Self> {
+    pub(crate) async fn new(pre: &InstancePre<HostState>) -> Result<Self> {
         let state = HostState {
             table: ResourceTable::new(),
             wasi: WasiCtxBuilder::new().build(),

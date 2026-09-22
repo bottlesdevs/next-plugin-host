@@ -36,7 +36,7 @@ pub struct Plugins {
 }
 
 impl Plugins {
-    pub async fn open(root: impl AsRef<Path>, runtime: Runtime) -> Result<Arc<Self>> {
+    pub async fn open(root: impl AsRef<Path>) -> Result<Arc<Self>> {
         let root = root.as_ref().to_owned();
         let index: BTreeMap<String, PluginInfo> =
             match async_fs::read_to_string(root.join("installed.toml")).await {
@@ -46,7 +46,7 @@ impl Plugins {
             };
         Ok(Arc::new(Self {
             root,
-            runtime,
+            runtime: Runtime::new()?,
             installed: RwLock::new(
                 index
                     .into_iter()
