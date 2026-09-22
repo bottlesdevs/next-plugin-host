@@ -1,6 +1,7 @@
 mod bindings;
 mod inspection;
 mod manifest;
+mod packages;
 mod runtime;
 pub mod storefront;
 
@@ -17,10 +18,15 @@ pub use bindings::exports::bottles::plugin::storefront_provider::{
 pub use inspection::exported_interfaces;
 pub use interfaces::PluginInterface;
 pub use manifest::{PluginManifest, parse_manifest};
+pub use packages::{LoadedPlugin, Plugins};
 pub use runtime::{CompiledPlugin, Runtime};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
+    #[error("package index: {0}")]
+    Index(#[from] next_config::error::Error),
+    #[error("package task: {0}")]
+    Task(#[from] tokio::task::JoinError),
     #[error("invalid component: {0}")]
     Component(#[from] wasmparser::BinaryReaderError),
     #[error("plugin manifest schema {0} is not supported")]
@@ -35,8 +41,9 @@ pub enum PluginError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PluginInfo {
+    pub revision: uuid::Uuid,
     pub manifest: PluginManifest,
     pub interfaces: Vec<String>,
 }

@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-fs.workspace = true
+next-config.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["serde"] }
 wasmparser = "0.252"
 blocking.workspace = true
 serde.workspace = true
@@ -15,7 +19,7 @@ semver.workspace = true
 thiserror.workspace = true
 toml = "0.9.10"
 async-trait.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
 tokio-util = { workspace = true, features = ["rt"] }
 url = { workspace = true, features = ["serde"] }
 wasmtime = { version = "47", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation"] }
