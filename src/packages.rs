@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{HostState, PluginError, PluginInfo, Result, Runtime, parse_manifest};
 
-use wasmtime::component::{InstancePre, types::ComponentItem};
+use wasmtime::component::{Component, InstancePre, types::ComponentItem};
 
 /// Captured metadata and code from one installed revision.
 #[derive(Clone)]
@@ -21,7 +21,7 @@ pub struct LoadedPlugin {
 
 struct InstalledPlugin {
     info: PluginInfo,
-    component: Option<InstancePre<HostState>>,
+    component: Option<Component>,
 }
 
 /// A shared package catalog. Installed revisions are immutable; compilation is lazy.
@@ -88,7 +88,7 @@ impl Plugins {
             if let Some(component) = &entry.component {
                 return Ok(LoadedPlugin {
                     info: entry.info.clone(),
-                    component: component.clone(),
+                    component: self.runtime.link(component)?,
                 });
             }
         }
@@ -101,18 +101,26 @@ impl Plugins {
             (entry.info.clone(), entry.component.clone())
         };
         if let Some(component) = cached {
-            return Ok(LoadedPlugin { info, component });
+            drop(publication);
+            return Ok(LoadedPlugin {
+                info,
+                component: self.runtime.link(&component)?,
+            });
         }
         let bytes =
             async_fs::read(self.revision_directory(info.revision).join("plugin.wasm")).await?;
+        let component = self.runtime.compile(bytes).await?;
+        self.installed
+            .write()
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .component = Some(component.clone());
         drop(publication);
-        let component = self.runtime.prepare(bytes).await?;
-        if let Some(entry) = self.installed.write().unwrap().get_mut(id)
-            && entry.info.revision == info.revision
-        {
-            entry.component = Some(component.clone());
-        }
-        Ok(LoadedPlugin { info, component })
+        Ok(LoadedPlugin {
+            info,
+            component: self.runtime.link(&component)?,
+        })
     }
 
     /// Prepare a revision before committing it. Once entered, publication finishes
@@ -121,9 +129,8 @@ impl Plugins {
         let manifest =
             parse_manifest(&async_fs::read_to_string(source.join("plugin.toml")).await?)?;
         let bytes = async_fs::read(source.join("plugin.wasm")).await?;
-        let component = self.runtime.prepare(bytes.clone()).await?;
+        let component = self.runtime.compile(bytes.clone()).await?;
         let interfaces = component
-            .component()
             .component_type()
             .exports(component.engine())
             .filter(|(_, export)| matches!(export.ty, ComponentItem::ComponentInstance(_)))

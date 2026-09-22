@@ -30,14 +30,13 @@ impl Runtime {
         Ok(Self { engine, linker })
     }
 
-    pub async fn prepare(&self, bytes: Vec<u8>) -> Result<InstancePre<HostState>> {
+    pub(crate) async fn compile(&self, bytes: Vec<u8>) -> Result<Component> {
         let engine = self.engine.clone();
-        let linker = self.linker.clone();
-        blocking::unblock(move || {
-            let component = Component::from_binary(&engine, &bytes)?;
-            Ok(linker.instantiate_pre(&component)?)
-        })
-        .await
+        blocking::unblock(move || Ok(Component::from_binary(&engine, &bytes)?)).await
+    }
+
+    pub(crate) fn link(&self, component: &Component) -> Result<InstancePre<HostState>> {
+        Ok(self.linker.instantiate_pre(component)?)
     }
 }
 
