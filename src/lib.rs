@@ -1,4 +1,3 @@
-mod inspection;
 mod manifest;
 mod packages;
 mod runtime;
@@ -7,7 +6,6 @@ mod interfaces {
     include!(concat!(env!("OUT_DIR"), "/plugin_interfaces.rs"));
 }
 
-pub use inspection::exported_interfaces;
 pub use interfaces::PluginInterface;
 pub use manifest::{PluginManifest, parse_manifest};
 pub use packages::{LoadedPlugin, Plugins};
@@ -15,14 +13,12 @@ pub use runtime::{HostState, Invocation, Runtime};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
-    #[error("package index: {0}")]
-    Index(#[from] next_config::error::Error),
-    #[error("invalid component: {0}")]
-    Component(#[from] wasmparser::BinaryReaderError),
+    #[error("failed to serialize package index: {0}")]
+    SerializeIndex(#[from] toml::ser::Error),
     #[error("plugin manifest schema {0} is not supported")]
     UnsupportedSchema(u32),
-    #[error("failed to parse plugin manifest: {0}")]
-    ParseManifest(#[from] toml::de::Error),
+    #[error("failed to parse plugin metadata: {0}")]
+    ParseMetadata(#[from] toml::de::Error),
     #[error("plugin {0} was not found")]
     NotFound(String),
     #[error("plugin runtime failed: {0}")]
@@ -33,7 +29,7 @@ pub enum PluginError {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PluginInfo {
-    pub revision: uuid::Uuid,
+    pub(crate) revision: uuid::Uuid,
     pub manifest: PluginManifest,
     pub interfaces: Vec<String>,
 }

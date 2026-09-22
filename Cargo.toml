@@ -9,10 +9,8 @@ repository.workspace = true
 
 [dependencies]
 async-fs.workspace = true
-next-config.workspace = true
 tracing.workspace = true
 uuid = { workspace = true, features = ["serde"] }
-wasmparser = "0.252"
 blocking.workspace = true
 serde.workspace = true
 semver.workspace = true

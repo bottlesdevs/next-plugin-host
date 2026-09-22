@@ -5,16 +5,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use next_config::Config;
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{
-    HostState, PluginError, PluginInfo, Result, Runtime, exported_interfaces, parse_manifest,
-};
+use crate::{HostState, PluginError, PluginInfo, Result, Runtime, parse_manifest};
 
-use wasmtime::component::InstancePre;
+use wasmtime::component::{InstancePre, types::ComponentItem};
 
 /// Captured metadata and code from one installed revision.
 #[derive(Clone)]
@@ -28,38 +24,28 @@ struct InstalledPlugin {
     component: Option<InstancePre<HostState>>,
 }
 
-#[derive(Default, Serialize, Deserialize, Config)]
-#[config(version = 1)]
-struct InstalledIndex {
-    packages: BTreeMap<String, PluginInfo>,
-}
-
 /// A shared package catalog. Installed revisions are immutable; compilation is lazy.
 pub struct Plugins {
     root: PathBuf,
     runtime: Runtime,
     installed: RwLock<BTreeMap<String, InstalledPlugin>>,
-    lifecycle: Mutex<()>,
+    lifecycle: Arc<Mutex<()>>,
 }
 
 impl Plugins {
     pub async fn open(root: impl AsRef<Path>, runtime: Runtime) -> Result<Arc<Self>> {
         let root = root.as_ref().to_owned();
-        let index: InstalledIndex = match next_config::load(root.join("installed.toml")).await {
-            Ok(index) => index,
-            Err(next_config::error::Error::Io(error))
-                if error.kind() == io::ErrorKind::NotFound =>
-            {
-                InstalledIndex::default()
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let index: BTreeMap<String, PluginInfo> =
+            match async_fs::read_to_string(root.join("installed.toml")).await {
+                Ok(source) => toml::from_str(&source)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+                Err(error) => return Err(error.into()),
+            };
         Ok(Arc::new(Self {
             root,
             runtime,
             installed: RwLock::new(
                 index
-                    .packages
                     .into_iter()
                     .map(|(id, info)| {
                         (
@@ -72,7 +58,7 @@ impl Plugins {
                     })
                     .collect(),
             ),
-            lifecycle: Mutex::new(()),
+            lifecycle: Arc::new(Mutex::new(())),
         }))
     }
 
@@ -121,82 +107,99 @@ impl Plugins {
         Ok(LoadedPlugin { info, component })
     }
 
-    /// Prepare and publish a revision in the caller's future.
-    /// The caller must drive publication to completion; dropping the future abandons it.
-    pub async fn install(&self, source: &Path) -> Result<PluginInfo> {
-        let manifest_text = async_fs::read_to_string(source.join("plugin.toml")).await?;
-        let manifest = parse_manifest(&manifest_text)?;
+    /// Prepare a revision before committing it. Once entered, publication finishes
+    /// even if the caller drops its future; no guest code runs during installation.
+    pub async fn install(self: &Arc<Self>, source: &Path) -> Result<PluginInfo> {
+        let manifest =
+            parse_manifest(&async_fs::read_to_string(source.join("plugin.toml")).await?)?;
         let bytes = async_fs::read(source.join("plugin.wasm")).await?;
-        let interfaces = exported_interfaces(&bytes)?;
+        let component = self.runtime.prepare(bytes.clone()).await?;
+        let interfaces = component
+            .component()
+            .component_type()
+            .exports(component.engine())
+            .filter(|(_, export)| matches!(export.ty, ComponentItem::ComponentInstance(_)))
+            .map(|(name, _)| name.to_owned())
+            .collect();
         let info = PluginInfo {
             manifest,
             interfaces,
             revision: Uuid::new_v4(),
         };
-        let directory = self.revision_directory(info.revision);
-        async_fs::create_dir_all(&directory).await?;
-        async_fs::write(directory.join("plugin.toml"), manifest_text).await?;
-        async_fs::write(directory.join("plugin.wasm"), bytes).await?;
-
-        let _lifecycle = self.lifecycle.lock().await;
-        let old = self.publish(&info.manifest.id, Some(info.clone())).await?;
-        if let Some(old) = old {
-            self.cleanup(old.revision).await;
-        }
-        Ok(info)
+        let publication = self.lifecycle.clone().lock_owned().await;
+        let plugins = self.clone();
+        blocking::unblock(move || {
+            let directory = plugins.revision_directory(info.revision);
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(directory.join("plugin.wasm"), bytes)?;
+            let old = plugins.publish(
+                &info.manifest.id,
+                Some(InstalledPlugin {
+                    info: info.clone(),
+                    component: Some(component),
+                }),
+            )?;
+            drop(publication);
+            if let Some(old) = old {
+                plugins.cleanup(old.revision);
+            }
+            Ok(info)
+        })
+        .await
     }
 
-    /// Publish removal before cleanup; obsolete files cannot restore membership.
-    /// The caller must drive publication to completion; dropping the future abandons it.
-    pub async fn uninstall(&self, id: &str) -> Result<()> {
-        let _lifecycle = self.lifecycle.lock().await;
-        let old = self.publish(id, None).await?;
-        if let Some(old) = old {
-            self.cleanup(old.revision).await;
-        }
-        Ok(())
+    /// Remove catalog membership. Already captured revisions may finish their work.
+    /// Publication finishes even if the caller drops its future once it has begun.
+    pub async fn uninstall(self: &Arc<Self>, id: &str) -> Result<()> {
+        let publication = self.lifecycle.clone().lock_owned().await;
+        let plugins = self.clone();
+        let id = id.to_owned();
+        blocking::unblock(move || {
+            let old = plugins.publish(&id, None)?;
+            drop(publication);
+            if let Some(old) = old {
+                plugins.cleanup(old.revision);
+            }
+            Ok(())
+        })
+        .await
     }
 
-    // Caller owns lifecycle through saving the index and publishing the matching catalog.
-    async fn publish(&self, id: &str, info: Option<PluginInfo>) -> Result<Option<PluginInfo>> {
-        let mut index = InstalledIndex {
-            packages: self
-                .installed
-                .read()
-                .unwrap()
-                .iter()
-                .map(|(id, entry)| (id.clone(), entry.info.clone()))
-                .collect(),
-        };
-        match &info {
-            Some(info) => {
-                index.packages.insert(id.into(), info.clone());
+    // Caller holds the publication guard on a blocking worker through disk and memory changes.
+    fn publish(&self, id: &str, entry: Option<InstalledPlugin>) -> Result<Option<PluginInfo>> {
+        let mut index: BTreeMap<String, PluginInfo> = self
+            .installed
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.info.clone()))
+            .collect();
+        match &entry {
+            Some(entry) => {
+                index.insert(id.into(), entry.info.clone());
             }
             None => {
-                index.packages.remove(id);
+                index.remove(id);
             }
         }
-        next_config::save(self.root.join("installed.toml"), &index).await?;
+        std::fs::create_dir_all(&self.root)?;
+        let temporary = self.root.join("installed.tmp");
+        std::fs::write(&temporary, toml::to_string_pretty(&index)?)?;
+        std::fs::rename(temporary, self.root.join("installed.toml"))?;
         let mut installed = self.installed.write().unwrap();
-        let old = match info {
-            Some(info) => installed.insert(
-                id.into(),
-                InstalledPlugin {
-                    info,
-                    component: None,
-                },
-            ),
+        let old = match entry {
+            Some(entry) => installed.insert(id.into(), entry),
             None => installed.remove(id),
         };
-        Ok(old.map(|p| p.info))
+        Ok(old.map(|entry| entry.info))
     }
 
     fn revision_directory(&self, revision: Uuid) -> PathBuf {
         self.root.join("revisions").join(revision.to_string())
     }
 
-    async fn cleanup(&self, revision: Uuid) {
-        if let Err(error) = async_fs::remove_dir_all(self.revision_directory(revision)).await {
+    fn cleanup(&self, revision: Uuid) {
+        if let Err(error) = std::fs::remove_dir_all(self.revision_directory(revision)) {
             tracing::warn!(%revision, %error, "failed to remove obsolete plugin revision");
         }
     }
