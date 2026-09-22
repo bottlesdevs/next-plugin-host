@@ -25,11 +25,14 @@ struct InstalledPlugin {
 }
 
 /// A shared package catalog. Installed revisions are immutable; compilation is lazy.
+/// Open one catalog per root and share its `Arc`; independent writers are unsupported.
+/// Callers must await mutations to finish publication and cleanup. Dropping a future
+/// abandons remaining work and does not roll back an already published revision.
 pub struct Plugins {
     root: PathBuf,
     runtime: Runtime,
     installed: RwLock<BTreeMap<String, InstalledPlugin>>,
-    lifecycle: Arc<Mutex<()>>,
+    lifecycle: Mutex<()>,
 }
 
 impl Plugins {
@@ -58,7 +61,7 @@ impl Plugins {
                     })
                     .collect(),
             ),
-            lifecycle: Arc::new(Mutex::new(())),
+            lifecycle: Mutex::new(()),
         }))
     }
 
@@ -123,9 +126,8 @@ impl Plugins {
         })
     }
 
-    /// Prepare a revision before committing it. Once entered, publication finishes
-    /// even if the caller drops its future; no guest code runs during installation.
-    pub async fn install(self: &Arc<Self>, source: &Path) -> Result<PluginInfo> {
+    /// Compile and inspect a revision without resolving application imports or running guest code.
+    pub async fn install(&self, source: &Path) -> Result<PluginInfo> {
         let manifest =
             parse_manifest(&async_fs::read_to_string(source.join("plugin.toml")).await?)?;
         let bytes = async_fs::read(source.join("plugin.wasm")).await?;
@@ -141,47 +143,53 @@ impl Plugins {
             interfaces,
             revision: Uuid::new_v4(),
         };
-        let publication = self.lifecycle.clone().lock_owned().await;
-        let plugins = self.clone();
-        blocking::unblock(move || {
-            let directory = plugins.revision_directory(info.revision);
-            std::fs::create_dir_all(&directory)?;
-            std::fs::write(directory.join("plugin.wasm"), bytes)?;
-            let old = plugins.publish(
+        let publication = self.lifecycle.lock().await;
+        let directory = self.revision_directory(info.revision);
+        let result = async {
+            async_fs::create_dir_all(&directory).await?;
+            async_fs::write(directory.join("plugin.wasm"), bytes).await?;
+            self.publish(
                 &info.manifest.id,
                 Some(InstalledPlugin {
                     info: info.clone(),
                     component: Some(component),
                 }),
-            )?;
-            drop(publication);
-            if let Some(old) = old {
-                plugins.cleanup(old.revision);
+            )
+            .await
+        }
+        .await;
+        drop(publication);
+        match result {
+            Ok(old) => {
+                if let Some(old) = old {
+                    self.cleanup(old.revision).await;
+                }
+                Ok(info)
             }
-            Ok(info)
-        })
-        .await
+            Err(error) => {
+                self.cleanup(info.revision).await;
+                Err(error)
+            }
+        }
     }
 
     /// Remove catalog membership. Already captured revisions may finish their work.
-    /// Publication finishes even if the caller drops its future once it has begun.
-    pub async fn uninstall(self: &Arc<Self>, id: &str) -> Result<()> {
-        let publication = self.lifecycle.clone().lock_owned().await;
-        let plugins = self.clone();
-        let id = id.to_owned();
-        blocking::unblock(move || {
-            let old = plugins.publish(&id, None)?;
-            drop(publication);
-            if let Some(old) = old {
-                plugins.cleanup(old.revision);
-            }
-            Ok(())
-        })
-        .await
+    pub async fn uninstall(&self, id: &str) -> Result<()> {
+        let publication = self.lifecycle.lock().await;
+        let old = self.publish(id, None).await?;
+        drop(publication);
+        if let Some(old) = old {
+            self.cleanup(old.revision).await;
+        }
+        Ok(())
     }
 
-    // Caller holds the publication guard on a blocking worker through disk and memory changes.
-    fn publish(&self, id: &str, entry: Option<InstalledPlugin>) -> Result<Option<PluginInfo>> {
+    // Caller holds the publication guard through disk and memory changes.
+    async fn publish(
+        &self,
+        id: &str,
+        entry: Option<InstalledPlugin>,
+    ) -> Result<Option<PluginInfo>> {
         let mut index: BTreeMap<String, PluginInfo> = self
             .installed
             .read()
@@ -197,24 +205,32 @@ impl Plugins {
                 index.remove(id);
             }
         }
-        std::fs::create_dir_all(&self.root)?;
-        let temporary = self.root.join("installed.tmp");
-        std::fs::write(&temporary, toml::to_string_pretty(&index)?)?;
-        std::fs::rename(temporary, self.root.join("installed.toml"))?;
-        let mut installed = self.installed.write().unwrap();
-        let old = match entry {
-            Some(entry) => installed.insert(id.into(), entry),
-            None => installed.remove(id),
-        };
-        Ok(old.map(|entry| entry.info))
+        async_fs::create_dir_all(&self.root).await?;
+        let temporary = self.root.join(format!("installed-{}.tmp", Uuid::new_v4()));
+        let result = async {
+            async_fs::write(&temporary, toml::to_string_pretty(&index)?).await?;
+            // No await between the disk commit and publishing the same state in memory.
+            std::fs::rename(&temporary, self.root.join("installed.toml"))?;
+            let mut installed = self.installed.write().unwrap();
+            let old = match entry {
+                Some(entry) => installed.insert(id.into(), entry),
+                None => installed.remove(id),
+            };
+            Ok(old.map(|entry| entry.info))
+        }
+        .await;
+        if result.is_err() {
+            let _ = async_fs::remove_file(temporary).await;
+        }
+        result
     }
 
     fn revision_directory(&self, revision: Uuid) -> PathBuf {
         self.root.join("revisions").join(revision.to_string())
     }
 
-    fn cleanup(&self, revision: Uuid) {
-        if let Err(error) = std::fs::remove_dir_all(self.revision_directory(revision)) {
+    async fn cleanup(&self, revision: Uuid) {
+        if let Err(error) = async_fs::remove_dir_all(self.revision_directory(revision)).await {
             tracing::warn!(%revision, %error, "failed to remove obsolete plugin revision");
         }
     }
