@@ -19,7 +19,7 @@ semver.workspace = true
 thiserror.workspace = true
 toml = "0.9.10"
 async-trait.workspace = true
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true, features = ["rt"] }
 url = { workspace = true, features = ["serde"] }
 wasmtime = { version = "47", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation"] }

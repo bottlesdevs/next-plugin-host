@@ -7,8 +7,7 @@ use std::{
 
 use next_config::Config;
 use serde::{Deserialize, Serialize};
-use tokio::{runtime::Handle, sync::Mutex};
-use tokio_util::task::TaskTracker;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
@@ -40,9 +39,7 @@ pub struct Plugins {
     root: PathBuf,
     runtime: Runtime,
     installed: RwLock<BTreeMap<String, InstalledPlugin>>,
-    lifecycle: Arc<Mutex<()>>,
-    commits: TaskTracker,
-    executor: Handle,
+    lifecycle: Mutex<()>,
 }
 
 impl Plugins {
@@ -75,9 +72,7 @@ impl Plugins {
                     })
                     .collect(),
             ),
-            lifecycle: Arc::default(),
-            commits: TaskTracker::new(),
-            executor: Handle::try_current().map_err(|e| PluginError::Runtime(e.to_string()))?,
+            lifecycle: Mutex::new(()),
         }))
     }
 
@@ -131,8 +126,9 @@ impl Plugins {
         Ok(LoadedPlugin { info, component })
     }
 
-    /// Prepare a revision, then own its publication even if the caller drops the future.
-    pub async fn install(self: &Arc<Self>, source: &Path) -> Result<PluginInfo> {
+    /// Prepare and publish a revision in the caller's future.
+    /// The caller must drive publication to completion; dropping the future abandons it.
+    pub async fn install(&self, source: &Path) -> Result<PluginInfo> {
         let manifest_text = async_fs::read_to_string(source.join("plugin.toml")).await?;
         let manifest = parse_manifest(&manifest_text)?;
         let bytes = async_fs::read(source.join("plugin.wasm")).await?;
@@ -147,43 +143,23 @@ impl Plugins {
         async_fs::write(directory.join("plugin.toml"), manifest_text).await?;
         async_fs::write(directory.join("plugin.wasm"), bytes).await?;
 
-        let guard = self.lifecycle.clone().lock_owned().await;
-        let plugins = self.clone();
-        self.commits
-            .spawn_on(
-                async move {
-                    let _guard = guard;
-                    let old = plugins
-                        .publish(&info.manifest.id, Some(info.clone()))
-                        .await?;
-                    if let Some(old) = old {
-                        plugins.cleanup(old.revision).await;
-                    }
-                    Ok(info)
-                },
-                &self.executor,
-            )
-            .await?
+        let _lifecycle = self.lifecycle.lock().await;
+        let old = self.publish(&info.manifest.id, Some(info.clone())).await?;
+        if let Some(old) = old {
+            self.cleanup(old.revision).await;
+        }
+        Ok(info)
     }
 
     /// Publish removal before cleanup; obsolete files cannot restore membership.
-    pub async fn uninstall(self: &Arc<Self>, id: &str) -> Result<()> {
-        let guard = self.lifecycle.clone().lock_owned().await;
-        let plugins = self.clone();
-        let id = id.to_owned();
-        self.commits
-            .spawn_on(
-                async move {
-                    let _guard = guard;
-                    let old = plugins.publish(&id, None).await?;
-                    if let Some(old) = old {
-                        plugins.cleanup(old.revision).await;
-                    }
-                    Ok(())
-                },
-                &self.executor,
-            )
-            .await?
+    /// The caller must drive publication to completion; dropping the future abandons it.
+    pub async fn uninstall(&self, id: &str) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let old = self.publish(id, None).await?;
+        if let Some(old) = old {
+            self.cleanup(old.revision).await;
+        }
+        Ok(())
     }
 
     // Caller owns lifecycle through saving the index and publishing the matching catalog.

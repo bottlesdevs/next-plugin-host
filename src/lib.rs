@@ -25,8 +25,6 @@ pub use runtime::{CompiledPlugin, Runtime};
 pub enum PluginError {
     #[error("package index: {0}")]
     Index(#[from] next_config::error::Error),
-    #[error("package task: {0}")]
-    Task(#[from] tokio::task::JoinError),
     #[error("invalid component: {0}")]
     Component(#[from] wasmparser::BinaryReaderError),
     #[error("plugin manifest schema {0} is not supported")]
