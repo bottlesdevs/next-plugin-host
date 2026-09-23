@@ -1,8 +1,10 @@
+pub mod library;
 mod manifest;
 mod packages;
 mod runtime;
 pub mod storefront;
-pub use storefront::{AccountIdentity, Authentication, LinkedAccount, OwnedGame};
+pub use library::LibraryEntry;
+pub use storefront::{AccountIdentity, LinkedAccount};
 
 mod interfaces {
     include!(concat!(env!("OUT_DIR"), "/plugin_interfaces.rs"));

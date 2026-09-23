@@ -8,7 +8,7 @@ mod bindings {
     use std::sync::Arc;
     wasmtime::component::bindgen!({
         path: "../next-plugin-api/wit",
-        world: "storefront",
+        world: "account",
         additional_derives: [serde::Serialize, serde::Deserialize, PartialEq, Eq],
         imports: { default: async | trappable },
         exports: { default: async },
@@ -19,11 +19,7 @@ mod bindings {
 }
 
 pub use account_provider::{AccountIdentity, LinkedAccount};
-use bindings::{
-    bottles::plugin::account_link,
-    exports::bottles::plugin::{account_provider, library_provider},
-};
-pub use library_provider::{Authentication, OwnedGame};
+use bindings::{bottles::plugin::account_link, exports::bottles::plugin::account_provider};
 type Result<T> = std::result::Result<T, String>;
 
 pub(crate) fn add_plugin_imports(linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
@@ -76,58 +72,6 @@ pub async fn link_account(
                     .await?;
                 invocation.store.data_mut().table.delete(interaction)?;
                 Ok(result)
-            })
-        })
-        .await
-        .map_err(|error| error.to_string())?
-}
-
-pub async fn authenticate(
-    plugin: &LoadedPlugin,
-    account_id: &str,
-    credential: Option<&[u8]>,
-) -> Result<Authentication> {
-    let account_id = account_id.to_owned();
-    let credential = credential.map(<[u8]>::to_vec);
-    plugin
-        .worker
-        .call(move |invocation| {
-            Box::pin(async move {
-                let guest = match library_provider::GuestIndices::new(&invocation.component)
-                    .and_then(|indices| indices.load(&mut invocation.store, &invocation.instance))
-                {
-                    Ok(guest) => guest,
-                    Err(error) => return Ok(Err(error.to_string())),
-                };
-                guest
-                    .call_authenticate(&mut invocation.store, &account_id, credential.as_deref())
-                    .await
-            })
-        })
-        .await
-        .map_err(|error| error.to_string())?
-}
-
-pub async fn list_games(
-    plugin: &LoadedPlugin,
-    account_id: &str,
-    access: &[u8],
-) -> Result<Vec<OwnedGame>> {
-    let account_id = account_id.to_owned();
-    let access = access.to_vec();
-    plugin
-        .worker
-        .call(move |invocation| {
-            Box::pin(async move {
-                let guest = match library_provider::GuestIndices::new(&invocation.component)
-                    .and_then(|indices| indices.load(&mut invocation.store, &invocation.instance))
-                {
-                    Ok(guest) => guest,
-                    Err(error) => return Ok(Err(error.to_string())),
-                };
-                guest
-                    .call_list_games(&mut invocation.store, &account_id, &access)
-                    .await
             })
         })
         .await
