@@ -1,26 +1,56 @@
-mod bindings;
+mod manifest;
+mod packages;
 mod runtime;
+pub mod storefront;
+pub use storefront::{AccountIdentity, Authentication, LinkedAccount, OwnedGame};
 
-use async_trait::async_trait;
-use url::Url;
+mod interfaces {
+    include!(concat!(env!("OUT_DIR"), "/plugin_interfaces.rs"));
+}
 
-pub use bindings::exports::bottles::plugin::{
-    lifecycle::PluginKind,
-    storefront_account_provider::{AccountIdentity, LinkedAccount},
-    storefront_library_provider::{ListedGames, OwnedGame},
-};
-pub use runtime::Plugin;
+pub use interfaces::PluginInterface;
+pub use manifest::{PluginManifest, parse_manifest};
+pub use packages::{LoadedPlugin, Plugins};
+pub(crate) use runtime::{HostState, Runtime};
 
-pub type Result<T> = std::result::Result<T, String>;
+#[derive(Debug, thiserror::Error)]
+pub enum PluginError {
+    #[error("failed to serialize plugin metadata: {0}")]
+    SerializeMetadata(#[from] toml::ser::Error),
+    #[error("failed to parse plugin metadata: {0}")]
+    ParseMetadata(#[from] toml::de::Error),
+    #[error("plugin {0} was not found")]
+    NotFound(String),
+    #[error("plugin runtime failed: {0}")]
+    Runtime(#[from] wasmtime::Error),
+    #[error("I/O: {0}")]
+    Io(#[from] std::io::Error),
+}
 
-/// A host-owned interaction used by account-provider plugins to ask the user
-/// for a value, such as a browser callback URL or authorization code.
-/// The host parses the component's URL before invoking this callback.
-#[async_trait]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PluginInfo {
+    #[serde(flatten)]
+    pub manifest: PluginManifest,
+    pub(crate) interfaces: Vec<String>,
+}
+
+impl PluginInfo {
+    /// Reports export presence; typed binding checks compatibility on invocation.
+    pub fn exports(&self, interface: PluginInterface) -> bool {
+        self.interfaces
+            .iter()
+            .any(|name| name == interface.as_str())
+    }
+}
+
+pub type Result<T> = std::result::Result<T, PluginError>;
+
+/// Input capability supplied by the application to one account-link invocation.
+#[async_trait::async_trait]
 pub trait AccountLinkInteraction: Send + Sync {
     async fn request_input(
         &self,
-        url: Url,
+        url: url::Url,
         instructions: String,
     ) -> std::result::Result<String, String>;
 }

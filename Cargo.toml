@@ -8,10 +8,21 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-fs.workspace = true
 async-trait.workspace = true
+uuid.workspace = true
+blocking.workspace = true
+futures = { version = "0.3", default-features = false, features = ["std"] }
+serde.workspace = true
+semver.workspace = true
+thiserror.workspace = true
+toml = "0.9.10"
 tokio = { workspace = true, features = ["sync"] }
-tokio-util = { workspace = true, features = ["rt"] }
-url.workspace = true
-wasmtime = { version = "47", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation"] }
+url = { workspace = true, features = ["serde"] }
+wasmtime.workspace = true
 wasmtime-wasi = { version = "47", default-features = false, features = ["p2"] }
 wasmtime-wasi-http = { version = "47", default-features = false, features = ["default-send-request", "p2"] }
+
+[build-dependencies]
+heck = "0.5"
+wit-parser = { version = "0.252", default-features = false, features = ["std"] }

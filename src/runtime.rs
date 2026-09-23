@@ -1,36 +1,51 @@
-use std::sync::Arc;
+use std::{future::Future, pin::Pin};
 
-use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
+use futures::{StreamExt, channel::mpsc};
+use tokio::sync::oneshot;
 use wasmtime::{
     Engine, Store,
-    component::{Component, HasSelf, Linker, Resource, ResourceAny, ResourceTable},
+    component::{Component, Instance, InstancePre, Linker, ResourceTable},
 };
+use wasmtime_wasi::runtime::{AbortOnDropJoinHandle, spawn};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{
     WasiHttpCtx,
     p2::{WasiHttpCtxView, WasiHttpView},
 };
 
-use crate::{
-    AccountLinkInteraction, LinkedAccount, ListedGames, PluginKind, Result,
-    bindings::{self, bottles::plugin::account_link},
-};
+use crate::Result;
 
-/// One initialized WebAssembly component and its persistent plugin resource.
-pub struct Plugin {
-    provides: Vec<PluginKind>,
-    instance: Mutex<PluginInstance>,
+/// Shared compiler and the complete host import environment. Preparation executes no guest code.
+pub(crate) struct Runtime {
+    engine: Engine,
+    linker: Linker<HostState>,
 }
 
-struct PluginInstance {
-    store: Store<HostState>,
-    guest: bindings::Plugin,
-    resource: ResourceAny,
+impl Runtime {
+    pub(crate) fn new() -> Result<Self> {
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config)?;
+        let mut linker = Linker::new(&engine);
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+        crate::storefront::add_plugin_imports(&mut linker)?;
+        Ok(Self { engine, linker })
+    }
+
+    pub(crate) async fn compile(&self, bytes: Vec<u8>) -> Result<Component> {
+        let engine = self.engine.clone();
+        blocking::unblock(move || Ok(Component::from_binary(&engine, &bytes)?)).await
+    }
+
+    pub(crate) fn link(&self, component: &Component) -> Result<InstancePre<HostState>> {
+        Ok(self.linker.instantiate_pre(component)?)
+    }
 }
 
-struct HostState {
-    table: ResourceTable,
+/// Resources owned by one loaded plugin runtime.
+pub(crate) struct HostState {
+    pub(crate) table: ResourceTable,
     wasi: WasiCtx,
     http: WasiHttpCtx,
 }
@@ -54,152 +69,86 @@ impl WasiHttpView for HostState {
     }
 }
 
-impl account_link::HostInteraction for HostState {
-    async fn request_input(
-        &mut self,
-        interaction: Resource<Arc<dyn AccountLinkInteraction>>,
-        url: String,
-        instructions: String,
-    ) -> wasmtime::Result<std::result::Result<String, String>> {
-        let interaction = self.table.get(&interaction)?.clone();
-        let url = match url::Url::parse(&url) {
-            Ok(url) => url,
-            Err(error) => return Ok(Err(format!("invalid interaction URL: {error}"))),
-        };
-        Ok(interaction.request_input(url, instructions).await)
-    }
+const INVOCATION_FUEL: u64 = 1_000_000_000;
+const YIELD_INTERVAL: u64 = 100_000;
+type CallFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+type Call = Box<dyn for<'a> FnOnce(&'a mut Invocation) -> CallFuture<'a, bool> + Send>;
 
-    async fn drop(
-        &mut self,
-        interaction: Resource<Arc<dyn AccountLinkInteraction>>,
-    ) -> wasmtime::Result<()> {
-        self.table.delete(interaction)?;
-        Ok(())
-    }
+/// One serialized worker. Its owner retains the task; the task never retains its owner.
+pub(crate) struct Worker {
+    pub(super) sender: mpsc::UnboundedSender<Call>,
+    _task: AbortOnDropJoinHandle<()>,
 }
 
-impl account_link::Host for HostState {}
-
-impl Plugin {
-    /// Compiles and initializes one component with standard WASI and WASI HTTP.
-    pub async fn load(component: &[u8]) -> Result<Self> {
-        let engine = Engine::new(&wasmtime::Config::new()).map_err(|error| error.to_string())?;
-        let mut linker = Linker::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|error| error.to_string())?;
-        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
-            .map_err(|error| error.to_string())?;
-        account_link::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-            .map_err(|error| error.to_string())?;
-
-        let component =
-            Component::from_binary(&engine, component).map_err(|error| error.to_string())?;
-        let state = HostState {
-            table: ResourceTable::new(),
-            wasi: WasiCtxBuilder::new().build(),
-            http: WasiHttpCtx::new(),
-        };
-        let mut store = Store::new(&engine, state);
-        let guest = bindings::Plugin::instantiate_async(&mut store, &component, &linker)
-            .await
-            .map_err(|error| error.to_string())?;
-        let provides = guest
-            .bottles_plugin_lifecycle()
-            .call_provides(&mut store)
-            .await
-            .map_err(|error| error.to_string())?;
-        let resource = guest
-            .bottles_plugin_lifecycle()
-            .plugin()
-            .call_new(&mut store)
-            .await
-            .map_err(|error| error.to_string())??;
-
+impl Worker {
+    pub(crate) async fn new(pre: InstancePre<HostState>) -> Result<Self> {
+        let mut invocation = spawn(Invocation::new(pre)).await?;
+        let (sender, mut receiver) = mpsc::unbounded::<Call>();
+        // ponytail: one queue serializes every capability; split only for a concrete concurrency need.
+        let task = spawn(async move {
+            while let Some(call) = receiver.next().await {
+                if !call(&mut invocation).await {
+                    break;
+                }
+            }
+        });
         Ok(Self {
-            provides,
-            instance: Mutex::new(PluginInstance {
-                store,
-                guest,
-                resource,
-            }),
+            sender,
+            _task: task,
         })
     }
 
-    /// The typed subsystem contributions declared by the component.
-    pub fn provides(&self) -> &[PluginKind] {
-        &self.provides
-    }
-
-    /// Invokes the storefront account-provider contribution.
-    pub async fn link_account(
-        &self,
-        interaction: Arc<dyn AccountLinkInteraction>,
-        cancellation: &CancellationToken,
-    ) -> Result<LinkedAccount> {
-        if !self
-            .provides
-            .contains(&PluginKind::StorefrontAccountProvider)
-        {
-            return Err("plugin does not advertise storefront-account-provider".into());
-        }
-
-        let Some(mut instance) = cancellation.run_until_cancelled(self.instance.lock()).await
-        else {
-            return Err("account linking cancelled".into());
-        };
-        let PluginInstance {
-            store,
-            guest,
-            resource,
-        } = &mut *instance;
-
-        let interaction = store
-            .data_mut()
-            .table
-            .push(interaction)
-            .map_err(|error| error.to_string())?;
-        let borrowed_interaction = Resource::new_borrow(interaction.rep());
-        let result = cancellation
-            .run_until_cancelled(
-                guest
-                    .bottles_plugin_storefront_account_provider()
-                    .call_link_account(&mut *store, *resource, borrowed_interaction),
-            )
-            .await;
-        store
-            .data_mut()
-            .table
-            .delete(interaction)
-            .map_err(|error| error.to_string())?;
-
-        result
-            .ok_or_else(|| "account linking cancelled".to_owned())?
-            .map_err(|error| error.to_string())?
-    }
-
-    /// Invokes the storefront library-provider contribution.
-    pub async fn list_games(
-        &self,
-        account_id: &str,
-        credential: Option<&[u8]>,
-    ) -> Result<ListedGames> {
-        if !self
-            .provides
-            .contains(&PluginKind::StorefrontLibraryProvider)
-        {
-            return Err("plugin does not advertise storefront-library-provider".into());
-        }
-
-        let mut instance = self.instance.lock().await;
-        let PluginInstance {
-            store,
-            guest,
-            resource,
-        } = &mut *instance;
-
-        guest
-            .bottles_plugin_storefront_library_provider()
-            .call_list_games(&mut *store, *resource, account_id, credential)
+    pub(crate) async fn call<T, F>(&self, call: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(&'a mut Invocation) -> CallFuture<'a, wasmtime::Result<T>>
+            + Send
+            + 'static,
+    {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .unbounded_send(Box::new(move |invocation| {
+                Box::pin(async move {
+                    let result = async {
+                        invocation.store.set_fuel(INVOCATION_FUEL)?;
+                        call(invocation).await
+                    }
+                    .await;
+                    // WIT errors are values inside Ok; only runtime failures retire the Store.
+                    let reusable = result.is_ok();
+                    let _ = reply.send(result);
+                    reusable
+                })
+            }))
+            .map_err(|_| wasmtime::Error::msg("plugin worker stopped; reload the plugin"))?;
+        Ok(response
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|_| wasmtime::Error::msg("plugin worker stopped before replying"))??)
+    }
+}
+
+/// The persistent Store and instance, accessed only by their worker.
+pub(crate) struct Invocation {
+    pub(crate) component: InstancePre<HostState>,
+    pub(crate) store: Store<HostState>,
+    pub(crate) instance: Instance,
+}
+
+impl Invocation {
+    async fn new(pre: InstancePre<HostState>) -> Result<Self> {
+        let state = HostState {
+            table: ResourceTable::new(),
+            wasi: WasiCtxBuilder::new().inherit_stderr().build(),
+            http: WasiHttpCtx::new(),
+        };
+        let mut store = Store::new(pre.engine(), state);
+        store.set_fuel(INVOCATION_FUEL)?;
+        store.fuel_async_yield_interval(Some(YIELD_INTERVAL))?;
+        let instance = pre.instantiate_async(&mut store).await?;
+        Ok(Self {
+            component: pre,
+            store,
+            instance,
+        })
     }
 }
