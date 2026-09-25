@@ -8,10 +8,7 @@ use wasmtime::{
 };
 use wasmtime_wasi::runtime::{AbortOnDropJoinHandle, spawn};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-use wasmtime_wasi_http::{
-    WasiHttpCtx,
-    p2::{WasiHttpCtxView, WasiHttpView},
-};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::Result;
 
@@ -150,5 +147,13 @@ impl Invocation {
             store,
             instance,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn runtime_initializes_with_selected_wasmtime_features() {
+        super::Runtime::new().expect("Wasmtime engine and WASI linkers must initialize");
     }
 }
