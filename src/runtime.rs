@@ -18,6 +18,7 @@ impl Runtime {
     pub(crate) fn new() -> Result<Self> {
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
+        config.wasm_component_model_async(true);
         Ok(Self {
             engine: Engine::new(&config)?,
         })
@@ -29,12 +30,12 @@ impl Runtime {
     }
 }
 
-/// Adds standard WASI and HTTP imports to a caller-owned linker.
+/// Adds standard WASI P3 and HTTP imports to a caller-owned linker.
 pub fn add_to_linker<T: WasiView + WasiHttpView + 'static>(
     linker: &mut Linker<T>,
 ) -> wasmtime::Result<()> {
-    wasmtime_wasi::p2::add_to_linker_async(linker)?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(linker)
+    wasmtime_wasi::p3::add_to_linker(linker)?;
+    wasmtime_wasi_http::p3::add_to_linker(linker)
 }
 
 /// Standard WASI state shared with the caller's domain imports.
@@ -96,6 +97,9 @@ impl<T: Send + 'static> Session<T> {
 
     /// Drives one call on the caller's future, retaining guest state on success.
     ///
+    /// Calls using WASI P3 imports must be polled in the caller's Tokio runtime
+    /// with I/O and time enabled.
+    ///
     /// Dropping an active call drops its store and closes this session. A runtime
     /// error also closes it; a WIT error returned inside `Ok` retains the instance.
     /// Dropping a call while it waits for the session leaves the running call intact.
@@ -127,6 +131,8 @@ pub struct Invocation<T: 'static> {
 
 impl<T: Send + 'static> Invocation<T> {
     /// Instantiates a caller-linked component without spawning a task.
+    /// When using WASI P3 imports, poll this future in the caller's Tokio runtime
+    /// with I/O and time enabled.
     pub async fn new(pre: &InstancePre<T>, state: T) -> Result<Self> {
         let mut store = Store::new(pre.engine(), state);
         store.set_fuel(INVOCATION_FUEL)?;
