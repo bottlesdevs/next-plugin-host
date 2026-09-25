@@ -1,14 +1,11 @@
-pub mod library;
 mod manifest;
 mod packages;
 mod runtime;
-pub mod storefront;
-pub use library::LibraryEntry;
-pub use storefront::{AccountIdentity, LinkedAccount};
 
 pub use manifest::{PluginManifest, parse_manifest};
-pub use packages::{LoadedPlugin, Plugins};
-pub(crate) use runtime::{HostState, Runtime};
+pub use packages::{CompiledPlugin, Plugins};
+pub(crate) use runtime::Runtime;
+pub use runtime::{Invocation, Session, WasiState, add_to_linker};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
@@ -40,13 +37,3 @@ impl PluginInfo {
 }
 
 pub type Result<T> = std::result::Result<T, PluginError>;
-
-/// Input capability supplied by the application to one account-link invocation.
-#[async_trait::async_trait]
-pub trait AccountLinkInteraction: Send + Sync {
-    async fn request_input(
-        &self,
-        url: url::Url,
-        instructions: String,
-    ) -> std::result::Result<String, String>;
-}

@@ -1,53 +1,64 @@
-use std::{future::Future, pin::Pin};
-
-use futures::{StreamExt, channel::mpsc};
-use tokio::sync::oneshot;
+use futures::future::BoxFuture;
+use tokio::sync::Mutex;
 use wasmtime::{
     Engine, Store,
     component::{Component, Instance, InstancePre, Linker, ResourceTable},
 };
-use wasmtime_wasi::runtime::{AbortOnDropJoinHandle, spawn};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::Result;
 
-/// Shared compiler and the complete host import environment. Preparation executes no guest code.
+/// Shared compiler. Compilation executes no guest code.
 pub(crate) struct Runtime {
     engine: Engine,
-    linker: Linker<HostState>,
 }
 
 impl Runtime {
     pub(crate) fn new() -> Result<Self> {
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
-        let engine = Engine::new(&config)?;
-        let mut linker = Linker::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-        crate::storefront::add_plugin_imports(&mut linker)?;
-        Ok(Self { engine, linker })
+        Ok(Self {
+            engine: Engine::new(&config)?,
+        })
     }
 
     pub(crate) async fn compile(&self, bytes: Vec<u8>) -> Result<Component> {
         let engine = self.engine.clone();
         blocking::unblock(move || Ok(Component::from_binary(&engine, &bytes)?)).await
     }
+}
 
-    pub(crate) fn link(&self, component: &Component) -> Result<InstancePre<HostState>> {
-        Ok(self.linker.instantiate_pre(component)?)
+/// Adds standard WASI and HTTP imports to a caller-owned linker.
+pub fn add_to_linker<T: WasiView + WasiHttpView + 'static>(
+    linker: &mut Linker<T>,
+) -> wasmtime::Result<()> {
+    wasmtime_wasi::p2::add_to_linker_async(linker)?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(linker)
+}
+
+/// Standard WASI state shared with the caller's domain imports.
+pub struct WasiState {
+    /// Resource table shared by all interfaces in this store.
+    pub table: ResourceTable,
+    /// Filesystem, environment, and other standard WASI capabilities.
+    pub wasi: WasiCtx,
+    /// Standard HTTP context.
+    pub http: WasiHttpCtx,
+}
+
+impl WasiState {
+    /// Uses the caller's WASI capabilities with a fresh resource table and HTTP context.
+    pub fn new(wasi: WasiCtx) -> Self {
+        Self {
+            table: ResourceTable::new(),
+            wasi,
+            http: WasiHttpCtx::new(),
+        }
     }
 }
 
-/// Resources owned by one loaded plugin runtime.
-pub(crate) struct HostState {
-    pub(crate) table: ResourceTable,
-    wasi: WasiCtx,
-    http: WasiHttpCtx,
-}
-
-impl WasiView for HostState {
+impl WasiView for WasiState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.wasi,
@@ -56,7 +67,7 @@ impl WasiView for HostState {
     }
 }
 
-impl WasiHttpView for HostState {
+impl WasiHttpView for WasiState {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView {
             ctx: &mut self.http,
@@ -68,85 +79,60 @@ impl WasiHttpView for HostState {
 
 const INVOCATION_FUEL: u64 = 1_000_000_000;
 const YIELD_INTERVAL: u64 = 100_000;
-type CallFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-type Call = Box<dyn for<'a> FnOnce(&'a mut Invocation) -> CallFuture<'a, bool> + Send>;
 
-/// One serialized worker. Its owner retains the task; the task never retains its owner.
-pub(crate) struct Worker {
-    pub(super) sender: mpsc::UnboundedSender<Call>,
-    _task: AbortOnDropJoinHandle<()>,
+/// One caller-owned persistent instance. Calls on this session are serialized.
+/// Separate sessions retain independent guest state and run independently.
+pub struct Session<T: 'static> {
+    invocation: Mutex<Option<Invocation<T>>>,
 }
 
-impl Worker {
-    pub(crate) async fn new(pre: InstancePre<HostState>) -> Result<Self> {
-        let mut invocation = spawn(Invocation::new(pre)).await?;
-        let (sender, mut receiver) = mpsc::unbounded::<Call>();
-        // ponytail: one queue serializes every capability; split only for a concrete concurrency need.
-        let task = spawn(async move {
-            while let Some(call) = receiver.next().await {
-                if !call(&mut invocation).await {
-                    break;
-                }
-            }
-        });
-        Ok(Self {
-            sender,
-            _task: task,
-        })
+impl<T: Send + 'static> Session<T> {
+    /// Takes ownership after the caller has loaded any typed export handles.
+    pub fn new(invocation: Invocation<T>) -> Self {
+        Self {
+            invocation: Mutex::new(Some(invocation)),
+        }
     }
 
-    pub(crate) async fn call<T, F>(&self, call: F) -> Result<T>
+    /// Drives one call on the caller's future, retaining guest state on success.
+    ///
+    /// Dropping an active call drops its store and closes this session. A runtime
+    /// error also closes it; a WIT error returned inside `Ok` retains the instance.
+    /// Dropping a call while it waits for the session leaves the running call intact.
+    /// Closed sessions reject later calls; the caller must explicitly open a new one.
+    pub async fn call<R, F>(&self, call: F) -> Result<R>
     where
-        T: Send + 'static,
-        F: for<'a> FnOnce(&'a mut Invocation) -> CallFuture<'a, wasmtime::Result<T>>
-            + Send
-            + 'static,
+        F: for<'a> FnOnce(&'a mut Invocation<T>) -> BoxFuture<'a, wasmtime::Result<R>> + Send,
     {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .unbounded_send(Box::new(move |invocation| {
-                Box::pin(async move {
-                    let result = async {
-                        invocation.store.set_fuel(INVOCATION_FUEL)?;
-                        call(invocation).await
-                    }
-                    .await;
-                    // WIT errors are values inside Ok; only runtime failures retire the Store.
-                    let reusable = result.is_ok();
-                    let _ = reply.send(result);
-                    reusable
-                })
-            }))
-            .map_err(|_| wasmtime::Error::msg("plugin worker stopped; reload the plugin"))?;
-        Ok(response
-            .await
-            .map_err(|_| wasmtime::Error::msg("plugin worker stopped before replying"))??)
+        let mut slot = self.invocation.lock().await;
+        let mut invocation = slot
+            .take()
+            .ok_or_else(|| wasmtime::Error::msg("plugin session is closed"))?;
+        invocation.store.set_fuel(INVOCATION_FUEL)?;
+        let result = call(&mut invocation).await;
+        if result.is_ok() {
+            *slot = Some(invocation);
+        }
+        Ok(result?)
     }
 }
 
-/// The persistent Store and instance, accessed only by their worker.
-pub(crate) struct Invocation {
-    pub(crate) component: InstancePre<HostState>,
-    pub(crate) store: Store<HostState>,
-    pub(crate) instance: Instance,
+/// A store and its instance, owned by the active call while a session is running.
+pub struct Invocation<T: 'static> {
+    /// Store holding the caller's state and guest memory.
+    pub store: Store<T>,
+    /// Component instance whose exports use this store.
+    pub instance: Instance,
 }
 
-impl Invocation {
-    async fn new(pre: InstancePre<HostState>) -> Result<Self> {
-        let state = HostState {
-            table: ResourceTable::new(),
-            wasi: WasiCtxBuilder::new().inherit_stderr().build(),
-            http: WasiHttpCtx::new(),
-        };
+impl<T: Send + 'static> Invocation<T> {
+    /// Instantiates a caller-linked component without spawning a task.
+    pub async fn new(pre: &InstancePre<T>, state: T) -> Result<Self> {
         let mut store = Store::new(pre.engine(), state);
         store.set_fuel(INVOCATION_FUEL)?;
         store.fuel_async_yield_interval(Some(YIELD_INTERVAL))?;
         let instance = pre.instantiate_async(&mut store).await?;
-        Ok(Self {
-            component: pre,
-            store,
-            instance,
-        })
+        Ok(Self { store, instance })
     }
 }
 
@@ -154,6 +140,6 @@ impl Invocation {
 mod tests {
     #[test]
     fn runtime_initializes_with_selected_wasmtime_features() {
-        super::Runtime::new().expect("Wasmtime engine and WASI linkers must initialize");
+        super::Runtime::new().expect("Wasmtime engine must initialize");
     }
 }
