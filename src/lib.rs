@@ -6,11 +6,6 @@ pub mod storefront;
 pub use library::LibraryEntry;
 pub use storefront::{AccountIdentity, LinkedAccount};
 
-mod interfaces {
-    include!(concat!(env!("OUT_DIR"), "/plugin_interfaces.rs"));
-}
-
-pub use interfaces::PluginInterface;
 pub use manifest::{PluginManifest, parse_manifest};
 pub use packages::{LoadedPlugin, Plugins};
 pub(crate) use runtime::{HostState, Runtime};
@@ -38,10 +33,9 @@ pub struct PluginInfo {
 
 impl PluginInfo {
     /// Reports export presence; typed binding checks compatibility on invocation.
-    pub fn exports(&self, interface: PluginInterface) -> bool {
-        self.interfaces
-            .iter()
-            .any(|name| name == interface.as_str())
+    pub fn exports(&self, interface: impl AsRef<str>) -> bool {
+        let interface = interface.as_ref();
+        self.interfaces.iter().any(|name| name == interface)
     }
 }
 
