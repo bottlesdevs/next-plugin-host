@@ -4,7 +4,7 @@ use futures::future::BoxFuture;
 use tokio::sync::Mutex;
 use wasmtime::{
     Engine, Store,
-    component::{Component, Instance, InstancePre, Linker, ResourceTable},
+    component::{Accessor, Component, Instance, InstancePre, Linker, ResourceTable},
 };
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
@@ -120,7 +120,7 @@ impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
     }
 
     /// Drives one call on the caller's future, retaining guest state on success.
-    /// The callback receives this session's Store and typed bindings.
+    /// The callback receives this session's concurrent accessor and typed bindings.
     ///
     /// Calls using WASI P3 imports must be polled in the caller's Tokio runtime
     /// with I/O and time enabled.
@@ -132,7 +132,7 @@ impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
     pub async fn call<R, F>(&self, call: F) -> Result<R>
     where
         F: for<'a> FnOnce(
-                &'a mut Store<State>,
+                &'a Accessor<State>,
                 &'a mut Bindings,
             ) -> BoxFuture<'a, wasmtime::Result<R>>
             + Send,
@@ -142,7 +142,10 @@ impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
             .take()
             .ok_or_else(|| wasmtime::Error::msg("plugin session is closed"))?;
         invocation.store.set_fuel(INVOCATION_FUEL)?;
-        let result = call(&mut invocation.store, &mut bindings).await;
+        let result = invocation
+            .store
+            .run_concurrent(async |accessor| call(accessor, &mut bindings).await)
+            .await?;
         if result.is_ok() {
             *slot = Some((invocation, bindings));
         }

@@ -116,17 +116,17 @@ impl Plugins {
     pub async fn load<Bindings: Send>(
         &self,
         info: &PluginInfo,
-        add_domain_imports: impl FnOnce(&mut Linker<WasiState>) -> wasmtime::Result<()> + Send,
-        bind: impl FnOnce(&mut Store<WasiState>, &Instance) -> wasmtime::Result<Bindings> + Send,
+        register_imports: impl FnOnce(&mut Linker<WasiState>) -> wasmtime::Result<()> + Send,
+        load_exports: impl FnOnce(&mut Store<WasiState>, &Instance) -> wasmtime::Result<Bindings> + Send,
     ) -> Result<Plugin<WasiState, Bindings>> {
         let compiled = self.load_component(&info.manifest.id, false).await?;
         let mut linker = Linker::new(compiled.component.engine());
         add_to_linker(&mut linker)?;
-        add_domain_imports(&mut linker)?;
+        register_imports(&mut linker)?;
         let pre = linker.instantiate_pre(&compiled.component)?;
         let state = WasiState::new(WasiCtxBuilder::new().build());
         let mut invocation = PluginInstance::new(&pre, state).await?;
-        let bindings = bind(&mut invocation.store, &invocation.instance)?;
+        let bindings = load_exports(&mut invocation.store, &invocation.instance)?;
         Ok(Plugin::new(compiled, invocation, bindings))
     }
 
