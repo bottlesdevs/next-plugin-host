@@ -9,7 +9,7 @@ use wasmtime::{
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
-use crate::{CompiledPlugin, PluginInfo, Result};
+use crate::{PluginInfo, Result, packages::CompiledPlugin};
 
 /// Shared compiler. Compilation executes no guest code.
 pub(crate) struct Runtime {
@@ -33,7 +33,7 @@ impl Runtime {
 }
 
 /// Adds standard WASI P3 and HTTP imports to a caller-owned linker.
-pub fn add_to_linker<T: WasiView + WasiHttpView + 'static>(
+pub(crate) fn add_to_linker<T: WasiView + WasiHttpView + 'static>(
     linker: &mut Linker<T>,
 ) -> wasmtime::Result<()> {
     wasmtime_wasi::p3::add_to_linker(linker)?;
@@ -103,7 +103,7 @@ impl<State: 'static, Bindings> Clone for Plugin<State, Bindings> {
 
 impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
     /// Takes ownership of the instance and bindings loaded from it.
-    pub fn new(
+    pub(crate) fn new(
         compiled: Arc<CompiledPlugin>,
         invocation: PluginInstance<State>,
         bindings: Bindings,
@@ -120,6 +120,7 @@ impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
     }
 
     /// Drives one call on the caller's future, retaining guest state on success.
+    /// The callback receives this session's Store and typed bindings.
     ///
     /// Calls using WASI P3 imports must be polled in the caller's Tokio runtime
     /// with I/O and time enabled.
@@ -131,7 +132,7 @@ impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
     pub async fn call<R, F>(&self, call: F) -> Result<R>
     where
         F: for<'a> FnOnce(
-                &'a mut PluginInstance<State>,
+                &'a mut Store<State>,
                 &'a mut Bindings,
             ) -> BoxFuture<'a, wasmtime::Result<R>>
             + Send,
@@ -141,7 +142,7 @@ impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
             .take()
             .ok_or_else(|| wasmtime::Error::msg("plugin session is closed"))?;
         invocation.store.set_fuel(INVOCATION_FUEL)?;
-        let result = call(&mut invocation, &mut bindings).await;
+        let result = call(&mut invocation.store, &mut bindings).await;
         if result.is_ok() {
             *slot = Some((invocation, bindings));
         }
@@ -150,18 +151,18 @@ impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
 }
 
 /// A store and its instance, owned by the active call while a session is running.
-pub struct PluginInstance<T: 'static> {
+pub(crate) struct PluginInstance<T: 'static> {
     /// Store holding the caller's state and guest memory.
-    pub store: Store<T>,
+    pub(crate) store: Store<T>,
     /// Component instance whose exports use this store.
-    pub instance: Instance,
+    pub(crate) instance: Instance,
 }
 
 impl<T: Send + 'static> PluginInstance<T> {
     /// Instantiates a caller-linked component without spawning a task.
     /// When using WASI P3 imports, poll this future in the caller's Tokio runtime
     /// with I/O and time enabled.
-    pub async fn new(pre: &InstancePre<T>, state: T) -> Result<Self> {
+    pub(crate) async fn new(pre: &InstancePre<T>, state: T) -> Result<Self> {
         let mut store = Store::new(pre.engine(), state);
         store.set_fuel(INVOCATION_FUEL)?;
         store.fuel_async_yield_interval(Some(YIELD_INTERVAL))?;

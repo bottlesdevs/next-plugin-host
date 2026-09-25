@@ -9,23 +9,23 @@ use futures::StreamExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{PluginError, PluginInfo, Result, Runtime, parse_manifest};
+use crate::{
+    Plugin, PluginError, PluginInfo, Result, Runtime, WasiState, parse_manifest,
+    runtime::{PluginInstance, add_to_linker},
+};
 
-use wasmtime::component::{Component, types::ComponentItem};
+use wasmtime::{
+    Store,
+    component::{Component, Instance, Linker, types::ComponentItem},
+};
+use wasmtime_wasi::WasiCtxBuilder;
 
 /// Immutable code and metadata captured from one installed package.
 /// Sessions opened from this snapshot remain independent of later package changes.
-pub struct CompiledPlugin {
+pub(crate) struct CompiledPlugin {
     /// Metadata captured with this component.
-    pub info: PluginInfo,
+    pub(crate) info: PluginInfo,
     component: Component,
-}
-
-impl CompiledPlugin {
-    /// Returns the component for linking with the caller's imports and state.
-    pub fn component(&self) -> &Component {
-        &self.component
-    }
 }
 
 enum InstalledPlugin {
@@ -103,15 +103,38 @@ impl Plugins {
             .map(|p| p.info().clone())
     }
 
-    /// Returns the current compiled snapshot, compiling it on first use.
-    pub async fn load(&self, id: &str) -> Result<Arc<CompiledPlugin>> {
-        self.load_component(id, false).await
+    /// Opens an independent session from the current entry matching `info`'s ID.
+    /// Compilation is cached; the resulting plugin retains the resolved entry's
+    /// metadata even if the catalog is later changed or dropped.
+    /// Uses default WASI P3/HTTP state and the supplied domain imports and bindings.
+    /// Poll this future in the caller's Tokio runtime with I/O and time enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ID is no longer installed, the component cannot
+    /// compile or instantiate, or either supplied callback fails.
+    pub async fn load<Bindings: Send>(
+        &self,
+        info: &PluginInfo,
+        add_domain_imports: impl FnOnce(&mut Linker<WasiState>) -> wasmtime::Result<()> + Send,
+        bind: impl FnOnce(&mut Store<WasiState>, &Instance) -> wasmtime::Result<Bindings> + Send,
+    ) -> Result<Plugin<WasiState, Bindings>> {
+        let compiled = self.load_component(&info.manifest.id, false).await?;
+        let mut linker = Linker::new(compiled.component.engine());
+        add_to_linker(&mut linker)?;
+        add_domain_imports(&mut linker)?;
+        let pre = linker.instantiate_pre(&compiled.component)?;
+        let state = WasiState::new(WasiCtxBuilder::new().build());
+        let mut invocation = PluginInstance::new(&pre, state).await?;
+        let bindings = bind(&mut invocation.store, &invocation.instance)?;
+        Ok(Plugin::new(compiled, invocation, bindings))
     }
 
     /// Compiles a fresh snapshot of the installed code for subsequent loads.
     /// Existing snapshots and sessions keep their code and state; package files are unchanged.
-    pub async fn reload(&self, id: &str) -> Result<Arc<CompiledPlugin>> {
-        self.load_component(id, true).await
+    pub async fn reload(&self, id: &str) -> Result<()> {
+        self.load_component(id, true).await?;
+        Ok(())
     }
 
     async fn load_component(&self, id: &str, reload: bool) -> Result<Arc<CompiledPlugin>> {
