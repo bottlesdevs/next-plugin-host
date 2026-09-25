@@ -8,6 +8,7 @@ use std::{
 use futures::StreamExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use wasmtime_wasi_http::WasiHttpView;
 
 use crate::{
     Plugin, PluginError, PluginInfo, Result, Runtime, WasiState, parse_manifest,
@@ -18,7 +19,7 @@ use wasmtime::{
     Store,
     component::{Component, Instance, Linker, types::ComponentItem},
 };
-use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::{WasiCtxBuilder, WasiView};
 
 /// Immutable code and metadata captured from one installed package.
 /// Sessions opened from this snapshot remain independent of later package changes.
@@ -113,18 +114,22 @@ impl Plugins {
     ///
     /// Returns an error if the ID is no longer installed, the component cannot
     /// compile or instantiate, or either supplied callback fails.
-    pub async fn load<Bindings: Send>(
+    pub async fn load<State, Bindings>(
         &self,
         info: &PluginInfo,
-        register_imports: impl FnOnce(&mut Linker<WasiState>) -> wasmtime::Result<()> + Send,
-        load_exports: impl FnOnce(&mut Store<WasiState>, &Instance) -> wasmtime::Result<Bindings> + Send,
-    ) -> Result<Plugin<WasiState, Bindings>> {
+        state: State,
+        register_imports: impl FnOnce(&mut Linker<State>) -> wasmtime::Result<()> + Send,
+        load_exports: impl FnOnce(&mut Store<State>, &Instance) -> wasmtime::Result<Bindings> + Send,
+    ) -> Result<Plugin<State, Bindings>>
+    where
+        State: WasiView + WasiHttpView + Send + 'static,
+        Bindings: Send,
+    {
         let compiled = self.load_component(&info.manifest.id, false).await?;
         let mut linker = Linker::new(compiled.component.engine());
         add_to_linker(&mut linker)?;
         register_imports(&mut linker)?;
         let pre = linker.instantiate_pre(&compiled.component)?;
-        let state = WasiState::new(WasiCtxBuilder::new().build());
         let mut invocation = PluginInstance::new(&pre, state).await?;
         let bindings = load_exports(&mut invocation.store, &invocation.instance)?;
         Ok(Plugin::new(compiled, invocation, bindings))
