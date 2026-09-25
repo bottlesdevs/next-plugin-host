@@ -1,19 +1,11 @@
-pub mod library;
 mod manifest;
 mod packages;
 mod runtime;
-pub mod storefront;
-pub use library::LibraryEntry;
-pub use storefront::{AccountIdentity, LinkedAccount};
 
-mod interfaces {
-    include!(concat!(env!("OUT_DIR"), "/plugin_interfaces.rs"));
-}
-
-pub use interfaces::PluginInterface;
 pub use manifest::{PluginManifest, parse_manifest};
-pub use packages::{LoadedPlugin, Plugins};
-pub(crate) use runtime::{HostState, Runtime};
+pub use packages::Plugins;
+pub(crate) use runtime::Runtime;
+pub use runtime::{Plugin, WasiState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
@@ -38,21 +30,10 @@ pub struct PluginInfo {
 
 impl PluginInfo {
     /// Reports export presence; typed binding checks compatibility on invocation.
-    pub fn exports(&self, interface: PluginInterface) -> bool {
-        self.interfaces
-            .iter()
-            .any(|name| name == interface.as_str())
+    pub fn exports(&self, interface: impl AsRef<str>) -> bool {
+        let interface = interface.as_ref();
+        self.interfaces.iter().any(|name| name == interface)
     }
 }
 
 pub type Result<T> = std::result::Result<T, PluginError>;
-
-/// Input capability supplied by the application to one account-link invocation.
-#[async_trait::async_trait]
-pub trait AccountLinkInteraction: Send + Sync {
-    async fn request_input(
-        &self,
-        url: url::Url,
-        instructions: String,
-    ) -> std::result::Result<String, String>;
-}

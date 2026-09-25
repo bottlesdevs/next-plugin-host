@@ -8,28 +8,37 @@ use std::{
 use futures::StreamExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use wasmtime_wasi_http::WasiHttpView;
 
-use crate::{PluginError, PluginInfo, Result, Runtime, parse_manifest, runtime::Worker};
+use crate::{
+    Plugin, PluginError, PluginInfo, Result, Runtime, WasiState, parse_manifest,
+    runtime::{PluginInstance, add_to_linker},
+};
 
-use wasmtime::component::types::ComponentItem;
+use wasmtime::{
+    Store,
+    component::{Component, Instance, Linker, types::ComponentItem},
+};
+use wasmtime_wasi::{WasiCtxBuilder, WasiView};
 
-/// Captured metadata and a shared persistent runtime for one installed plugin.
-/// Calls are serialized; retired handles reject new calls and never change instance identity.
-#[derive(Clone)]
-pub struct LoadedPlugin {
-    pub info: PluginInfo,
-    pub(crate) worker: Arc<Worker>,
+/// Immutable code and metadata captured from one installed package.
+/// Sessions opened from this snapshot remain independent of later package changes.
+pub(crate) struct CompiledPlugin {
+    /// Metadata captured with this component.
+    pub(crate) info: PluginInfo,
+    component: Component,
 }
 
-struct InstalledPlugin {
-    info: PluginInfo,
-    loaded: Option<LoadedPlugin>,
+enum InstalledPlugin {
+    Uncompiled(PluginInfo),
+    Compiled(Arc<CompiledPlugin>),
 }
 
-impl Drop for InstalledPlugin {
-    fn drop(&mut self) {
-        if let Some(plugin) = &self.loaded {
-            plugin.worker.sender.close_channel();
+impl InstalledPlugin {
+    fn info(&self) -> &PluginInfo {
+        match self {
+            Self::Uncompiled(info) => info,
+            Self::Compiled(plugin) => &plugin.info,
         }
     }
 }
@@ -38,8 +47,8 @@ impl Drop for InstalledPlugin {
 /// Open one catalog per root and share its `Arc`; independent writers are unsupported.
 /// Callers must await mutations to finish publication and cleanup. Dropping a future
 /// abandons remaining work. Failed replacement after removal may require reinstalling.
-/// Dropping the last catalog owner retires its runtimes, including retained loaded handles.
-/// Runtime startup and package publication are serialized; calls to loaded plugins remain independent.
+/// Loading snapshots and package publication are serialized. Retained compiled snapshots
+/// and caller-owned sessions are unaffected by catalog changes or dropping the catalog.
 pub struct Plugins {
     root: PathBuf,
     staging_root: PathBuf,
@@ -63,10 +72,7 @@ impl Plugins {
                     let info: PluginInfo = toml::from_str(
                         &async_fs::read_to_string(directory.path().join("plugin.toml")).await?,
                     )?;
-                    installed.insert(
-                        info.manifest.id.clone(),
-                        InstalledPlugin { info, loaded: None },
-                    );
+                    installed.insert(info.manifest.id.clone(), InstalledPlugin::Uncompiled(info));
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -86,7 +92,7 @@ impl Plugins {
             .read()
             .unwrap()
             .values()
-            .map(|p| p.info.clone())
+            .map(|p| p.info().clone())
             .collect()
     }
 
@@ -95,27 +101,55 @@ impl Plugins {
             .read()
             .unwrap()
             .get(id)
-            .map(|p| p.info.clone())
+            .map(|p| p.info().clone())
     }
 
-    pub async fn load(&self, id: &str) -> Result<LoadedPlugin> {
-        self.load_runtime(id, false).await
+    /// Opens an independent session from the current entry matching `info`'s ID.
+    /// Compilation is cached; the resulting plugin retains the resolved entry's
+    /// metadata even if the catalog is later changed or dropped.
+    /// Uses default WASI P3/HTTP state and the supplied domain imports and bindings.
+    /// Poll this future in the caller's Tokio runtime with I/O and time enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ID is no longer installed, the component cannot
+    /// compile or instantiate, or either supplied callback fails.
+    pub async fn load<State, Bindings>(
+        &self,
+        info: &PluginInfo,
+        state: State,
+        register_imports: impl FnOnce(&mut Linker<State>) -> wasmtime::Result<()> + Send,
+        load_exports: impl FnOnce(&mut Store<State>, &Instance) -> wasmtime::Result<Bindings> + Send,
+    ) -> Result<Plugin<State, Bindings>>
+    where
+        State: WasiView + WasiHttpView + Send + 'static,
+        Bindings: Send,
+    {
+        let compiled = self.load_component(&info.manifest.id, false).await?;
+        let mut linker = Linker::new(compiled.component.engine());
+        add_to_linker(&mut linker)?;
+        register_imports(&mut linker)?;
+        let pre = linker.instantiate_pre(&compiled.component)?;
+        let mut invocation = PluginInstance::new(&pre, state).await?;
+        let bindings = load_exports(&mut invocation.store, &invocation.instance)?;
+        Ok(Plugin::new(compiled, invocation, bindings))
     }
 
-    /// Retire the current runtime and start a replacement using the installed code.
-    /// This changes no package files.
-    pub async fn reload(&self, id: &str) -> Result<LoadedPlugin> {
-        self.load_runtime(id, true).await
+    /// Compiles a fresh snapshot of the installed code for subsequent loads.
+    /// Existing snapshots and sessions keep their code and state; package files are unchanged.
+    pub async fn reload(&self, id: &str) -> Result<()> {
+        self.load_component(id, true).await?;
+        Ok(())
     }
 
-    async fn load_runtime(&self, id: &str, reload: bool) -> Result<LoadedPlugin> {
+    async fn load_component(&self, id: &str, reload: bool) -> Result<Arc<CompiledPlugin>> {
         if !reload {
             let installed = self.installed.read().unwrap();
             let entry = installed
                 .get(id)
                 .ok_or_else(|| PluginError::NotFound(id.into()))?;
-            if let Some(loaded) = &entry.loaded {
-                return Ok(loaded.clone());
+            if let InstalledPlugin::Compiled(compiled) = entry {
+                return Ok(compiled.clone());
             }
         }
         let _lifecycle = self.lifecycle.lock().await;
@@ -124,27 +158,16 @@ impl Plugins {
             let entry = installed
                 .get(id)
                 .ok_or_else(|| PluginError::NotFound(id.into()))?;
-            if !reload && let Some(loaded) = &entry.loaded {
-                return Ok(loaded.clone());
+            if !reload && let InstalledPlugin::Compiled(compiled) = entry {
+                return Ok(compiled.clone());
             }
-            entry.info.clone()
+            entry.info().clone()
         };
         let bytes = async_fs::read(self.directory(id).join("plugin.wasm")).await?;
         let component = self.runtime.compile(bytes).await?;
-        let pre = self.runtime.link(&component)?;
-        if reload {
-            let mut installed = self.installed.write().unwrap();
-            let entry = installed.get_mut(id).unwrap();
-            *entry = InstalledPlugin {
-                info: info.clone(),
-                loaded: None,
-            };
-        }
-        let plugin = LoadedPlugin {
-            info,
-            worker: Arc::new(Worker::new(pre).await?),
-        };
-        self.installed.write().unwrap().get_mut(id).unwrap().loaded = Some(plugin.clone());
+        let plugin = Arc::new(CompiledPlugin { info, component });
+        *self.installed.write().unwrap().get_mut(id).unwrap() =
+            InstalledPlugin::Compiled(plugin.clone());
         Ok(plugin)
     }
 
@@ -178,16 +201,16 @@ impl Plugins {
             async_fs::create_dir_all(self.root.join("installed")).await?;
             let _publication = self.lifecycle.lock().await;
             let mut installed = self.installed.write().unwrap();
-            // Retire, remove, rename and publish without yielding after withdrawal begins.
-            drop(installed.remove(&info.manifest.id));
+            // Remove, rename and publish without yielding after withdrawal begins.
+            installed.remove(&info.manifest.id);
             remove_directory(&directory)?;
             std::fs::rename(&workspace, &directory)?;
             installed.insert(
                 info.manifest.id.clone(),
-                InstalledPlugin {
+                InstalledPlugin::Compiled(Arc::new(CompiledPlugin {
                     info: info.clone(),
-                    loaded: None,
-                },
+                    component,
+                })),
             );
             Ok(info)
         }
@@ -198,12 +221,12 @@ impl Plugins {
         result
     }
 
-    /// Remove catalog membership and retire the runtime. Already accepted calls may finish.
+    /// Removes the package without affecting retained snapshots or sessions.
     pub async fn uninstall(&self, id: &str) -> Result<()> {
         let directory = self.directory(id);
         let _publication = self.lifecycle.lock().await;
         let mut installed = self.installed.write().unwrap();
-        drop(installed.remove(id));
+        installed.remove(id);
         remove_directory(&directory)?;
         Ok(())
     }
