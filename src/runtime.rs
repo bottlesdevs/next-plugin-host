@@ -87,28 +87,30 @@ const YIELD_INTERVAL: u64 = 100_000;
 /// Clones share and serialize calls; separate openings retain independent guest state.
 pub struct Plugin<State: 'static, Bindings> {
     compiled: Arc<CompiledPlugin>,
-    invocation: Arc<Mutex<Option<(Invocation<State>, Bindings)>>>,
+    instance: Arc<Mutex<Option<(PluginInstance<State>, Bindings)>>>,
 }
 
+// Deriving Clone would require State and Bindings to implement Clone, even though
+// cloning this handle only clones the Arcs and shares the same instance.
 impl<State: 'static, Bindings> Clone for Plugin<State, Bindings> {
     fn clone(&self) -> Self {
         Self {
             compiled: self.compiled.clone(),
-            invocation: self.invocation.clone(),
+            instance: self.instance.clone(),
         }
     }
 }
 
 impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
-    /// Takes ownership of the invocation and bindings loaded from it.
+    /// Takes ownership of the instance and bindings loaded from it.
     pub fn new(
         compiled: Arc<CompiledPlugin>,
-        invocation: Invocation<State>,
+        invocation: PluginInstance<State>,
         bindings: Bindings,
     ) -> Self {
         Self {
             compiled,
-            invocation: Arc::new(Mutex::new(Some((invocation, bindings)))),
+            instance: Arc::new(Mutex::new(Some((invocation, bindings)))),
         }
     }
 
@@ -129,12 +131,12 @@ impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
     pub async fn call<R, F>(&self, call: F) -> Result<R>
     where
         F: for<'a> FnOnce(
-                &'a mut Invocation<State>,
+                &'a mut PluginInstance<State>,
                 &'a mut Bindings,
             ) -> BoxFuture<'a, wasmtime::Result<R>>
             + Send,
     {
-        let mut slot = self.invocation.lock().await;
+        let mut slot = self.instance.lock().await;
         let (mut invocation, mut bindings) = slot
             .take()
             .ok_or_else(|| wasmtime::Error::msg("plugin session is closed"))?;
@@ -148,14 +150,14 @@ impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
 }
 
 /// A store and its instance, owned by the active call while a session is running.
-pub struct Invocation<T: 'static> {
+pub struct PluginInstance<T: 'static> {
     /// Store holding the caller's state and guest memory.
     pub store: Store<T>,
     /// Component instance whose exports use this store.
     pub instance: Instance,
 }
 
-impl<T: Send + 'static> Invocation<T> {
+impl<T: Send + 'static> PluginInstance<T> {
     /// Instantiates a caller-linked component without spawning a task.
     /// When using WASI P3 imports, poll this future in the caller's Tokio runtime
     /// with I/O and time enabled.
