@@ -28,9 +28,18 @@ impl CompiledPlugin {
     }
 }
 
-struct InstalledPlugin {
-    info: PluginInfo,
-    compiled: Option<Arc<CompiledPlugin>>,
+enum InstalledPlugin {
+    Uncompiled(PluginInfo),
+    Compiled(Arc<CompiledPlugin>),
+}
+
+impl InstalledPlugin {
+    fn info(&self) -> &PluginInfo {
+        match self {
+            Self::Uncompiled(info) => info,
+            Self::Compiled(plugin) => &plugin.info,
+        }
+    }
 }
 
 /// A shared catalog of packages in `installed/<plugin-id>`. Compilation is lazy.
@@ -62,13 +71,7 @@ impl Plugins {
                     let info: PluginInfo = toml::from_str(
                         &async_fs::read_to_string(directory.path().join("plugin.toml")).await?,
                     )?;
-                    installed.insert(
-                        info.manifest.id.clone(),
-                        InstalledPlugin {
-                            info,
-                            compiled: None,
-                        },
-                    );
+                    installed.insert(info.manifest.id.clone(), InstalledPlugin::Uncompiled(info));
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -88,7 +91,7 @@ impl Plugins {
             .read()
             .unwrap()
             .values()
-            .map(|p| p.info.clone())
+            .map(|p| p.info().clone())
             .collect()
     }
 
@@ -97,7 +100,7 @@ impl Plugins {
             .read()
             .unwrap()
             .get(id)
-            .map(|p| p.info.clone())
+            .map(|p| p.info().clone())
     }
 
     /// Returns the current compiled snapshot, compiling it on first use.
@@ -117,7 +120,7 @@ impl Plugins {
             let entry = installed
                 .get(id)
                 .ok_or_else(|| PluginError::NotFound(id.into()))?;
-            if let Some(compiled) = &entry.compiled {
+            if let InstalledPlugin::Compiled(compiled) = entry {
                 return Ok(compiled.clone());
             }
         }
@@ -127,20 +130,16 @@ impl Plugins {
             let entry = installed
                 .get(id)
                 .ok_or_else(|| PluginError::NotFound(id.into()))?;
-            if !reload && let Some(compiled) = &entry.compiled {
+            if !reload && let InstalledPlugin::Compiled(compiled) = entry {
                 return Ok(compiled.clone());
             }
-            entry.info.clone()
+            entry.info().clone()
         };
         let bytes = async_fs::read(self.directory(id).join("plugin.wasm")).await?;
         let component = self.runtime.compile(bytes).await?;
         let plugin = Arc::new(CompiledPlugin { info, component });
-        self.installed
-            .write()
-            .unwrap()
-            .get_mut(id)
-            .unwrap()
-            .compiled = Some(plugin.clone());
+        *self.installed.write().unwrap().get_mut(id).unwrap() =
+            InstalledPlugin::Compiled(plugin.clone());
         Ok(plugin)
     }
 
@@ -180,13 +179,10 @@ impl Plugins {
             std::fs::rename(&workspace, &directory)?;
             installed.insert(
                 info.manifest.id.clone(),
-                InstalledPlugin {
+                InstalledPlugin::Compiled(Arc::new(CompiledPlugin {
                     info: info.clone(),
-                    compiled: Some(Arc::new(CompiledPlugin {
-                        info: info.clone(),
-                        component,
-                    })),
-                },
+                    component,
+                })),
             );
             Ok(info)
         }
