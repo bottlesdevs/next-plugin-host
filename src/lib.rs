@@ -5,7 +5,7 @@ mod runtime;
 pub use manifest::{PluginManifest, parse_manifest};
 pub use packages::{CompiledPlugin, Plugins};
 pub(crate) use runtime::Runtime;
-pub use runtime::{Invocation, Session, WasiState, add_to_linker};
+pub use runtime::{Invocation, Plugin, WasiState, add_to_linker};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {

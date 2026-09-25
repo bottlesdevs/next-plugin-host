@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use futures::future::BoxFuture;
 use tokio::sync::Mutex;
 use wasmtime::{
@@ -7,7 +9,7 @@ use wasmtime::{
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
-use crate::Result;
+use crate::{CompiledPlugin, PluginInfo, Result};
 
 /// Shared compiler. Compilation executes no guest code.
 pub(crate) struct Runtime {
@@ -81,18 +83,38 @@ impl WasiHttpView for WasiState {
 const INVOCATION_FUEL: u64 = 1_000_000_000;
 const YIELD_INTERVAL: u64 = 100_000;
 
-/// One caller-owned persistent instance. Calls on this session are serialized.
-/// Separate sessions retain independent guest state and run independently.
-pub struct Session<T: 'static> {
-    invocation: Mutex<Option<Invocation<T>>>,
+/// One caller-owned persistent instance and its typed bindings.
+/// Clones share and serialize calls; separate openings retain independent guest state.
+pub struct Plugin<State: 'static, Bindings> {
+    compiled: Arc<CompiledPlugin>,
+    invocation: Arc<Mutex<Option<(Invocation<State>, Bindings)>>>,
 }
 
-impl<T: Send + 'static> Session<T> {
-    /// Takes ownership after the caller has loaded any typed export handles.
-    pub fn new(invocation: Invocation<T>) -> Self {
+impl<State: 'static, Bindings> Clone for Plugin<State, Bindings> {
+    fn clone(&self) -> Self {
         Self {
-            invocation: Mutex::new(Some(invocation)),
+            compiled: self.compiled.clone(),
+            invocation: self.invocation.clone(),
         }
+    }
+}
+
+impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
+    /// Takes ownership of the invocation and bindings loaded from it.
+    pub fn new(
+        compiled: Arc<CompiledPlugin>,
+        invocation: Invocation<State>,
+        bindings: Bindings,
+    ) -> Self {
+        Self {
+            compiled,
+            invocation: Arc::new(Mutex::new(Some((invocation, bindings)))),
+        }
+    }
+
+    /// Borrows the compiled generation's metadata, including after this session closes.
+    pub fn info(&self) -> &PluginInfo {
+        &self.compiled.info
     }
 
     /// Drives one call on the caller's future, retaining guest state on success.
@@ -100,22 +122,26 @@ impl<T: Send + 'static> Session<T> {
     /// Calls using WASI P3 imports must be polled in the caller's Tokio runtime
     /// with I/O and time enabled.
     ///
-    /// Dropping an active call drops its store and closes this session. A runtime
-    /// error also closes it; a WIT error returned inside `Ok` retains the instance.
+    /// Dropping an active call drops its store and bindings and closes this session.
+    /// A runtime error also closes it; a WIT error returned inside `Ok` retains both.
     /// Dropping a call while it waits for the session leaves the running call intact.
     /// Closed sessions reject later calls; the caller must explicitly open a new one.
     pub async fn call<R, F>(&self, call: F) -> Result<R>
     where
-        F: for<'a> FnOnce(&'a mut Invocation<T>) -> BoxFuture<'a, wasmtime::Result<R>> + Send,
+        F: for<'a> FnOnce(
+                &'a mut Invocation<State>,
+                &'a mut Bindings,
+            ) -> BoxFuture<'a, wasmtime::Result<R>>
+            + Send,
     {
         let mut slot = self.invocation.lock().await;
-        let mut invocation = slot
+        let (mut invocation, mut bindings) = slot
             .take()
             .ok_or_else(|| wasmtime::Error::msg("plugin session is closed"))?;
         invocation.store.set_fuel(INVOCATION_FUEL)?;
-        let result = call(&mut invocation).await;
+        let result = call(&mut invocation, &mut bindings).await;
         if result.is_ok() {
-            *slot = Some(invocation);
+            *slot = Some((invocation, bindings));
         }
         Ok(result?)
     }
