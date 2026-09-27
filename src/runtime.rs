@@ -33,9 +33,7 @@ impl Runtime {
 }
 
 /// Adds standard WASI P3 and HTTP imports to a caller-owned linker.
-pub(crate) fn add_to_linker<T: WasiView + WasiHttpView + 'static>(
-    linker: &mut Linker<T>,
-) -> wasmtime::Result<()> {
+pub(crate) fn add_to_linker(linker: &mut Linker<WasiState>) -> wasmtime::Result<()> {
     wasmtime_wasi::p3::add_to_linker(linker)?;
     wasmtime_wasi_http::p3::add_to_linker(linker)
 }
@@ -85,14 +83,14 @@ const YIELD_INTERVAL: u64 = 100_000;
 
 /// One caller-owned persistent instance and its typed bindings.
 /// Clones share and serialize calls; separate openings retain independent guest state.
-pub struct Plugin<State: 'static, Bindings> {
+pub struct Plugin<Bindings> {
     compiled: Arc<CompiledPlugin>,
-    instance: Arc<Mutex<Option<(PluginInstance<State>, Bindings)>>>,
+    instance: Arc<Mutex<Option<(PluginInstance, Bindings)>>>,
 }
 
-// Deriving Clone would require State and Bindings to implement Clone, even though
+// Deriving Clone would require Bindings to implement Clone, even though
 // cloning this handle only clones the Arcs and shares the same instance.
-impl<State: 'static, Bindings> Clone for Plugin<State, Bindings> {
+impl<Bindings> Clone for Plugin<Bindings> {
     fn clone(&self) -> Self {
         Self {
             compiled: self.compiled.clone(),
@@ -101,16 +99,16 @@ impl<State: 'static, Bindings> Clone for Plugin<State, Bindings> {
     }
 }
 
-impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
+impl<Bindings: Send> Plugin<Bindings> {
     /// Takes ownership of the instance and bindings loaded from it.
     pub(crate) fn new(
         compiled: Arc<CompiledPlugin>,
-        invocation: PluginInstance<State>,
+        instance: PluginInstance,
         bindings: Bindings,
     ) -> Self {
         Self {
             compiled,
-            instance: Arc::new(Mutex::new(Some((invocation, bindings)))),
+            instance: Arc::new(Mutex::new(Some((instance, bindings)))),
         }
     }
 
@@ -132,40 +130,40 @@ impl<State: Send + 'static, Bindings: Send> Plugin<State, Bindings> {
     pub async fn call<R, F>(&self, call: F) -> Result<R>
     where
         F: for<'a> FnOnce(
-                &'a Accessor<State>,
+                &'a Accessor<WasiState>,
                 &'a mut Bindings,
             ) -> BoxFuture<'a, wasmtime::Result<R>>
             + Send,
     {
         let mut slot = self.instance.lock().await;
-        let (mut invocation, mut bindings) = slot
+        let (mut instance, mut bindings) = slot
             .take()
             .ok_or_else(|| wasmtime::Error::msg("plugin session is closed"))?;
-        invocation.store.set_fuel(INVOCATION_FUEL)?;
-        let result = invocation
+        instance.store.set_fuel(INVOCATION_FUEL)?;
+        let result = instance
             .store
             .run_concurrent(async |accessor| call(accessor, &mut bindings).await)
             .await?;
         if result.is_ok() {
-            *slot = Some((invocation, bindings));
+            *slot = Some((instance, bindings));
         }
         Ok(result?)
     }
 }
 
 /// A store and its instance, owned by the active call while a session is running.
-pub(crate) struct PluginInstance<T: 'static> {
-    /// Store holding the caller's state and guest memory.
-    pub(crate) store: Store<T>,
+pub(crate) struct PluginInstance {
+    /// Store holding WASI state and guest memory.
+    pub(crate) store: Store<WasiState>,
     /// Component instance whose exports use this store.
     pub(crate) instance: Instance,
 }
 
-impl<T: Send + 'static> PluginInstance<T> {
+impl PluginInstance {
     /// Instantiates a caller-linked component without spawning a task.
     /// When using WASI P3 imports, poll this future in the caller's Tokio runtime
     /// with I/O and time enabled.
-    pub(crate) async fn new(pre: &InstancePre<T>, state: T) -> Result<Self> {
+    pub(crate) async fn new(pre: &InstancePre<WasiState>, state: WasiState) -> Result<Self> {
         let mut store = Store::new(pre.engine(), state);
         store.set_fuel(INVOCATION_FUEL)?;
         store.fuel_async_yield_interval(Some(YIELD_INTERVAL))?;
