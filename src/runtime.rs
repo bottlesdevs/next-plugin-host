@@ -81,11 +81,11 @@ impl WasiHttpView for WasiState {
 const INVOCATION_FUEL: u64 = 1_000_000_000;
 const YIELD_INTERVAL: u64 = 100_000;
 
-/// One caller-owned persistent instance and its typed bindings.
-/// Clones share and serialize calls; separate openings retain independent guest state.
+/// Typed bindings to a plugin's shared guest session.
+/// Clones share the bindings; all bindings for one plugin serialize calls through its store.
 pub struct Plugin<Bindings> {
-    compiled: Arc<CompiledPlugin>,
-    instance: Arc<Mutex<Option<(PluginInstance, Bindings)>>>,
+    session: Arc<PluginSession>,
+    bindings: Arc<Bindings>,
 }
 
 // Deriving Clone would require Bindings to implement Clone, even though
@@ -93,28 +93,24 @@ pub struct Plugin<Bindings> {
 impl<Bindings> Clone for Plugin<Bindings> {
     fn clone(&self) -> Self {
         Self {
-            compiled: self.compiled.clone(),
-            instance: self.instance.clone(),
+            session: self.session.clone(),
+            bindings: self.bindings.clone(),
         }
     }
 }
 
-impl<Bindings: Send> Plugin<Bindings> {
-    /// Takes ownership of the instance and bindings loaded from it.
-    pub(crate) fn new(
-        compiled: Arc<CompiledPlugin>,
-        instance: PluginInstance,
-        bindings: Bindings,
-    ) -> Self {
+impl<Bindings: Send + Sync> Plugin<Bindings> {
+    /// Attaches typed bindings to a shared session.
+    pub(crate) fn new(session: Arc<PluginSession>, bindings: Bindings) -> Self {
         Self {
-            compiled,
-            instance: Arc::new(Mutex::new(Some((instance, bindings)))),
+            session,
+            bindings: Arc::new(bindings),
         }
     }
 
     /// Borrows the compiled generation's metadata, including after this session closes.
     pub fn info(&self) -> &PluginInfo {
-        &self.compiled.info
+        &self.session.compiled.info
     }
 
     /// Drives one call on the caller's future, retaining guest state on success.
@@ -123,52 +119,60 @@ impl<Bindings: Send> Plugin<Bindings> {
     /// Calls using WASI P3 imports must be polled in the caller's Tokio runtime
     /// with I/O and time enabled.
     ///
-    /// Dropping an active call drops its store and bindings and closes this session.
-    /// A runtime error also closes it; a WIT error returned inside `Ok` retains both.
+    /// Dropping an active call drops its store and closes this session.
+    /// A runtime error also closes it; a WIT error returned inside `Ok` retains it.
     /// Dropping a call while it waits for the session leaves the running call intact.
-    /// Closed sessions reject later calls; the caller must explicitly open a new one.
+    /// Closed sessions reject later calls; a later catalog load opens a new session.
     pub async fn call<R, F>(&self, call: F) -> Result<R>
     where
         F: for<'a> FnOnce(
                 &'a Accessor<WasiState>,
-                &'a mut Bindings,
+                &'a Bindings,
             ) -> BoxFuture<'a, wasmtime::Result<R>>
             + Send,
     {
-        let mut slot = self.instance.lock().await;
-        let (mut instance, mut bindings) = slot
+        let mut slot = self.session.store.lock().await;
+        let mut store = slot
             .take()
             .ok_or_else(|| wasmtime::Error::msg("plugin session is closed"))?;
-        instance.store.set_fuel(INVOCATION_FUEL)?;
-        let result = instance
-            .store
-            .run_concurrent(async |accessor| call(accessor, &mut bindings).await)
+        store.set_fuel(INVOCATION_FUEL)?;
+        let result = store
+            .run_concurrent(async |accessor| call(accessor, &self.bindings).await)
             .await?;
         if result.is_ok() {
-            *slot = Some((instance, bindings));
+            *slot = Some(store);
         }
         Ok(result?)
     }
 }
 
-/// A store and its instance, owned by the active call while a session is running.
-pub(crate) struct PluginInstance {
-    /// Store holding WASI state and guest memory.
-    pub(crate) store: Store<WasiState>,
+/// One shared guest session for all typed interfaces of a plugin generation.
+pub(crate) struct PluginSession {
+    pub(crate) compiled: Arc<CompiledPlugin>,
     /// Component instance whose exports use this store.
     pub(crate) instance: Instance,
+    /// Store holding WASI state and guest memory; absent after closure.
+    pub(crate) store: Mutex<Option<Store<WasiState>>>,
 }
 
-impl PluginInstance {
+impl PluginSession {
     /// Instantiates a caller-linked component without spawning a task.
     /// When using WASI P3 imports, poll this future in the caller's Tokio runtime
     /// with I/O and time enabled.
-    pub(crate) async fn new(pre: &InstancePre<WasiState>, state: WasiState) -> Result<Self> {
+    pub(crate) async fn new(
+        compiled: Arc<CompiledPlugin>,
+        pre: &InstancePre<WasiState>,
+        state: WasiState,
+    ) -> Result<Self> {
         let mut store = Store::new(pre.engine(), state);
         store.set_fuel(INVOCATION_FUEL)?;
         store.fuel_async_yield_interval(Some(YIELD_INTERVAL))?;
         let instance = pre.instantiate_async(&mut store).await?;
-        Ok(Self { store, instance })
+        Ok(Self {
+            compiled,
+            instance,
+            store: Mutex::new(Some(store)),
+        })
     }
 }
 
