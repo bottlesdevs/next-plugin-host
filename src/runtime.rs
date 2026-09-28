@@ -1,53 +1,73 @@
-use std::{future::Future, pin::Pin};
+use std::sync::Arc;
 
-use futures::{StreamExt, channel::mpsc};
-use tokio::sync::oneshot;
+use futures::future::BoxFuture;
+use tokio::sync::Mutex;
 use wasmtime::{
     Engine, Store,
-    component::{Component, Instance, InstancePre, Linker, ResourceTable},
+    component::{Accessor, Component, Instance, InstancePre, Linker, ResourceAny, ResourceTable},
 };
-use wasmtime_wasi::runtime::{AbortOnDropJoinHandle, spawn};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
-use crate::Result;
+use crate::{PluginInfo, Result, packages::CompiledPlugin};
 
-/// Shared compiler and the complete host import environment. Preparation executes no guest code.
+mod bindings {
+    wasmtime::component::bindgen!({
+        path: "../next-plugin-api/wit",
+        world: "plugin-object",
+        exports: { default: async | store },
+    });
+}
+
+/// Shared compiler. Compilation executes no guest code.
 pub(crate) struct Runtime {
     engine: Engine,
-    linker: Linker<HostState>,
 }
 
 impl Runtime {
     pub(crate) fn new() -> Result<Self> {
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
-        let engine = Engine::new(&config)?;
-        let mut linker = Linker::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-        crate::storefront::add_plugin_imports(&mut linker)?;
-        Ok(Self { engine, linker })
+        config.wasm_component_model_async(true);
+        Ok(Self {
+            engine: Engine::new(&config)?,
+        })
     }
 
     pub(crate) async fn compile(&self, bytes: Vec<u8>) -> Result<Component> {
         let engine = self.engine.clone();
         blocking::unblock(move || Ok(Component::from_binary(&engine, &bytes)?)).await
     }
+}
 
-    pub(crate) fn link(&self, component: &Component) -> Result<InstancePre<HostState>> {
-        Ok(self.linker.instantiate_pre(component)?)
+/// Adds standard WASI P3 and HTTP imports to a caller-owned linker.
+pub(crate) fn add_to_linker(linker: &mut Linker<WasiState>) -> wasmtime::Result<()> {
+    wasmtime_wasi::p3::add_to_linker(linker)?;
+    wasmtime_wasi_http::p3::add_to_linker(linker)
+}
+
+/// Standard WASI state shared with the caller's domain imports.
+pub struct WasiState {
+    /// Resource table shared by all interfaces in this store.
+    pub table: ResourceTable,
+    /// Filesystem, environment, and other standard WASI capabilities.
+    pub wasi: WasiCtx,
+    /// Standard HTTP context.
+    pub http: WasiHttpCtx,
+}
+
+impl WasiState {
+    /// Uses the caller's WASI capabilities with a fresh resource table and HTTP context.
+    pub fn new(wasi: WasiCtx) -> Self {
+        Self {
+            table: ResourceTable::new(),
+            wasi,
+            http: WasiHttpCtx::new(),
+        }
     }
 }
 
-/// Resources owned by one loaded plugin runtime.
-pub(crate) struct HostState {
-    pub(crate) table: ResourceTable,
-    wasi: WasiCtx,
-    http: WasiHttpCtx,
-}
-
-impl WasiView for HostState {
+impl WasiView for WasiState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.wasi,
@@ -56,7 +76,7 @@ impl WasiView for HostState {
     }
 }
 
-impl WasiHttpView for HostState {
+impl WasiHttpView for WasiState {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView {
             ctx: &mut self.http,
@@ -68,84 +88,115 @@ impl WasiHttpView for HostState {
 
 const INVOCATION_FUEL: u64 = 1_000_000_000;
 const YIELD_INTERVAL: u64 = 100_000;
-type CallFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-type Call = Box<dyn for<'a> FnOnce(&'a mut Invocation) -> CallFuture<'a, bool> + Send>;
 
-/// One serialized worker. Its owner retains the task; the task never retains its owner.
-pub(crate) struct Worker {
-    pub(super) sender: mpsc::UnboundedSender<Call>,
-    _task: AbortOnDropJoinHandle<()>,
+/// Typed bindings to a plugin's shared guest session.
+/// Clones share the bindings; all bindings for one plugin serialize calls through its store.
+pub struct Plugin<Bindings> {
+    session: Arc<PluginSession>,
+    bindings: Arc<Bindings>,
 }
 
-impl Worker {
-    pub(crate) async fn new(pre: InstancePre<HostState>) -> Result<Self> {
-        let mut invocation = spawn(Invocation::new(pre)).await?;
-        let (sender, mut receiver) = mpsc::unbounded::<Call>();
-        // ponytail: one queue serializes every capability; split only for a concrete concurrency need.
-        let task = spawn(async move {
-            while let Some(call) = receiver.next().await {
-                if !call(&mut invocation).await {
-                    break;
-                }
-            }
-        });
-        Ok(Self {
-            sender,
-            _task: task,
-        })
+// Deriving Clone would require Bindings to implement Clone, even though
+// cloning this handle only clones the Arcs and shares the same instance.
+impl<Bindings> Clone for Plugin<Bindings> {
+    fn clone(&self) -> Self {
+        Self {
+            session: self.session.clone(),
+            bindings: self.bindings.clone(),
+        }
+    }
+}
+
+impl<Bindings: Send + Sync> Plugin<Bindings> {
+    /// Attaches typed bindings to a shared session.
+    pub(crate) fn new(session: Arc<PluginSession>, bindings: Bindings) -> Self {
+        Self {
+            session,
+            bindings: Arc::new(bindings),
+        }
     }
 
-    pub(crate) async fn call<T, F>(&self, call: F) -> Result<T>
+    /// Borrows the compiled generation's metadata, including after this session closes.
+    pub fn info(&self) -> &PluginInfo {
+        &self.session.compiled.info
+    }
+
+    /// Drives one call on the caller's future, retaining guest state on success.
+    /// The callback receives this session's concurrent accessor, typed bindings,
+    /// and the guest object to borrow for provider calls.
+    ///
+    /// Calls using WASI P3 imports must be polled in the caller's Tokio runtime
+    /// with I/O and time enabled.
+    ///
+    /// Dropping an active call drops its store and closes this session.
+    /// A runtime error also closes it; a WIT error returned inside `Ok` retains it.
+    /// Dropping a call while it waits for the session leaves the running call intact.
+    /// Closed sessions reject later calls; a later catalog load opens a new session.
+    pub async fn call<R, F>(&self, call: F) -> Result<R>
     where
-        T: Send + 'static,
-        F: for<'a> FnOnce(&'a mut Invocation) -> CallFuture<'a, wasmtime::Result<T>>
-            + Send
-            + 'static,
+        F: for<'a> FnOnce(
+                &'a Accessor<WasiState>,
+                &'a Bindings,
+                ResourceAny,
+            ) -> BoxFuture<'a, wasmtime::Result<R>>
+            + Send,
     {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .unbounded_send(Box::new(move |invocation| {
-                Box::pin(async move {
-                    let result = async {
-                        invocation.store.set_fuel(INVOCATION_FUEL)?;
-                        call(invocation).await
-                    }
-                    .await;
-                    // WIT errors are values inside Ok; only runtime failures retire the Store.
-                    let reusable = result.is_ok();
-                    let _ = reply.send(result);
-                    reusable
-                })
-            }))
-            .map_err(|_| wasmtime::Error::msg("plugin worker stopped; reload the plugin"))?;
-        Ok(response
-            .await
-            .map_err(|_| wasmtime::Error::msg("plugin worker stopped before replying"))??)
+        let mut slot = self.session.store.lock().await;
+        let mut store = slot
+            .take()
+            .ok_or_else(|| wasmtime::Error::msg("plugin session is closed"))?;
+        store.set_fuel(INVOCATION_FUEL)?;
+        let result = store
+            .run_concurrent(async |accessor| {
+                call(accessor, &self.bindings, self.session.guest_object).await
+            })
+            .await?;
+        if result.is_ok() {
+            *slot = Some(store);
+        }
+        Ok(result?)
     }
 }
 
-/// The persistent Store and instance, accessed only by their worker.
-pub(crate) struct Invocation {
-    pub(crate) component: InstancePre<HostState>,
-    pub(crate) store: Store<HostState>,
+/// One shared guest session for all typed interfaces of a plugin generation.
+pub(crate) struct PluginSession {
+    pub(crate) compiled: Arc<CompiledPlugin>,
+    /// Component instance whose exports use this store.
     pub(crate) instance: Instance,
+    /// Guest-owned object borrowed by all provider interfaces.
+    pub(crate) guest_object: ResourceAny,
+    /// Store holding WASI state and guest memory; absent after closure.
+    pub(crate) store: Mutex<Option<Store<WasiState>>>,
 }
 
-impl Invocation {
-    async fn new(pre: InstancePre<HostState>) -> Result<Self> {
-        let state = HostState {
-            table: ResourceTable::new(),
-            wasi: WasiCtxBuilder::new().inherit_stderr().build(),
-            http: WasiHttpCtx::new(),
-        };
+impl PluginSession {
+    /// Instantiates a caller-linked component without spawning a task.
+    /// When using WASI P3 imports, poll this future in the caller's Tokio runtime
+    /// with I/O and time enabled.
+    pub(crate) async fn new(
+        compiled: Arc<CompiledPlugin>,
+        pre: &InstancePre<WasiState>,
+        state: WasiState,
+    ) -> Result<Self> {
         let mut store = Store::new(pre.engine(), state);
         store.set_fuel(INVOCATION_FUEL)?;
         store.fuel_async_yield_interval(Some(YIELD_INTERVAL))?;
         let instance = pre.instantiate_async(&mut store).await?;
+        let bindings = bindings::PluginObject::new(&mut store, &instance)?;
+        let guest_object = store
+            .run_concurrent(async |accessor| {
+                bindings
+                    .bottles_plugin_plugin_state()
+                    .plugin()
+                    .call_constructor(accessor)
+                    .await
+            })
+            .await??;
         Ok(Self {
-            component: pre,
-            store,
+            compiled,
             instance,
+            guest_object,
+            store: Mutex::new(Some(store)),
         })
     }
 }
@@ -154,6 +205,6 @@ impl Invocation {
 mod tests {
     #[test]
     fn runtime_initializes_with_selected_wasmtime_features() {
-        super::Runtime::new().expect("Wasmtime engine and WASI linkers must initialize");
+        super::Runtime::new().expect("Wasmtime engine must initialize");
     }
 }
