@@ -4,12 +4,20 @@ use futures::future::BoxFuture;
 use tokio::sync::Mutex;
 use wasmtime::{
     Engine, Store,
-    component::{Accessor, Component, Instance, InstancePre, Linker, ResourceTable},
+    component::{Accessor, Component, Instance, InstancePre, Linker, ResourceAny, ResourceTable},
 };
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::{PluginInfo, Result, packages::CompiledPlugin};
+
+mod bindings {
+    wasmtime::component::bindgen!({
+        path: "../next-plugin-api/wit",
+        world: "plugin-object",
+        exports: { default: async | store },
+    });
+}
 
 /// Shared compiler. Compilation executes no guest code.
 pub(crate) struct Runtime {
@@ -114,7 +122,8 @@ impl<Bindings: Send + Sync> Plugin<Bindings> {
     }
 
     /// Drives one call on the caller's future, retaining guest state on success.
-    /// The callback receives this session's concurrent accessor and typed bindings.
+    /// The callback receives this session's concurrent accessor, typed bindings,
+    /// and the guest object to borrow for provider calls.
     ///
     /// Calls using WASI P3 imports must be polled in the caller's Tokio runtime
     /// with I/O and time enabled.
@@ -128,6 +137,7 @@ impl<Bindings: Send + Sync> Plugin<Bindings> {
         F: for<'a> FnOnce(
                 &'a Accessor<WasiState>,
                 &'a Bindings,
+                ResourceAny,
             ) -> BoxFuture<'a, wasmtime::Result<R>>
             + Send,
     {
@@ -137,7 +147,9 @@ impl<Bindings: Send + Sync> Plugin<Bindings> {
             .ok_or_else(|| wasmtime::Error::msg("plugin session is closed"))?;
         store.set_fuel(INVOCATION_FUEL)?;
         let result = store
-            .run_concurrent(async |accessor| call(accessor, &self.bindings).await)
+            .run_concurrent(async |accessor| {
+                call(accessor, &self.bindings, self.session.guest_object).await
+            })
             .await?;
         if result.is_ok() {
             *slot = Some(store);
@@ -151,6 +163,8 @@ pub(crate) struct PluginSession {
     pub(crate) compiled: Arc<CompiledPlugin>,
     /// Component instance whose exports use this store.
     pub(crate) instance: Instance,
+    /// Guest-owned object borrowed by all provider interfaces.
+    pub(crate) guest_object: ResourceAny,
     /// Store holding WASI state and guest memory; absent after closure.
     pub(crate) store: Mutex<Option<Store<WasiState>>>,
 }
@@ -168,9 +182,20 @@ impl PluginSession {
         store.set_fuel(INVOCATION_FUEL)?;
         store.fuel_async_yield_interval(Some(YIELD_INTERVAL))?;
         let instance = pre.instantiate_async(&mut store).await?;
+        let bindings = bindings::PluginObject::new(&mut store, &instance)?;
+        let guest_object = store
+            .run_concurrent(async |accessor| {
+                bindings
+                    .bottles_plugin_plugin_state()
+                    .plugin()
+                    .call_constructor(accessor)
+                    .await
+            })
+            .await??;
         Ok(Self {
             compiled,
             instance,
+            guest_object,
             store: Mutex::new(Some(store)),
         })
     }
