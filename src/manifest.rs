@@ -1,21 +1,19 @@
-use semver::Version;
-use serde::{Deserialize, Serialize};
-
-use crate::PluginError;
+use serde::Deserialize;
+use std::{fs, path::Path};
 
 /// Identity and display metadata shipped beside a plugin component.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PluginManifest {
-    pub schema_version: u32,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct Manifest {
+    /// Stable package identifier and directory name.
     pub id: String,
+    /// Display name.
     pub name: String,
-    pub version: Version,
-    pub description: String,
-    pub authors: Vec<String>,
-    pub license: String,
-    pub repository: url::Url,
+    /// Display version.
+    pub version: String,
 }
 
-pub fn parse_manifest(source: &str) -> Result<PluginManifest, PluginError> {
-    Ok(toml::from_str(source)?)
+impl Manifest {
+    pub(crate) fn read(path: &Path) -> wasmtime::Result<Self> {
+        Ok(toml::from_str(&fs::read_to_string(path)?)?)
+    }
 }
