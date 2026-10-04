@@ -48,19 +48,57 @@ pub(crate) struct Shared {
     pub(crate) calls: mpsc::UnboundedSender<Call>,
 }
 
-/// A loaded plugin with one instance shared by its exported capabilities.
+/// Holds a loaded guest instance shared by its capability handles.
+///
+/// [`crate::Plugins::load`] returns `Plugin<()>`. Use [`cast`](Plugin::cast) to
+/// obtain a typed handle implementing a core provider trait. Casting shares
+/// the store and guest state; it does not instantiate another component.
+///
+/// Handles and pending launch operations retain the driver's call channel.
+/// The driver exits when it observes that all senders have been dropped.
+///
+/// # Examples
+///
+/// ```text
+/// let plugin = plugins.load("example").await?;
+/// let account = plugin.cast::<bottles_plugin_host::Account>();
+/// let library = plugin.cast::<bottles_plugin_host::Library>();
+/// ```
 pub struct Plugin<C = ()> {
     pub(crate) shared: Arc<Shared>,
     capability: PhantomData<fn() -> C>,
 }
 
 /// Links a capability to the exported interface it requires.
+///
+/// [`crate::Account`] and [`crate::Library`] are the built-in markers. This
+/// mapping controls export discovery; provider implementations are supplied
+/// separately for their corresponding typed [`Plugin`] handles.
+///
+/// # Examples
+///
+/// ```text
+/// use bottles_plugin_host::{Capability, Library, PluginInterface};
+///
+/// let interface = <Library as Capability>::INTERFACE;
+/// let name = interface.as_str(); // "bottles:plugin/library-provider@0.1.0"
+/// ```
 pub trait Capability {
+    /// Names the versioned WIT interface required for a cast.
     const INTERFACE: PluginInterface;
 }
 
 impl<C> Plugin<C> {
     /// Returns the installed package metadata.
+    ///
+    /// This is the manifest captured during loading. Changes to package files
+    /// do not update the loaded handle's metadata.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// println!("{} {}", plugin.manifest().name, plugin.manifest().version);
+    /// ```
     pub fn manifest(&self) -> &Manifest {
         &self.shared.manifest
     }
@@ -76,6 +114,21 @@ impl Plugin {
     }
 
     /// Returns a shared handle when this component exports the capability's interface.
+    ///
+    /// Returns [`None`] when the exact versioned name in [`Capability::INTERFACE`]
+    /// is absent. This checks only that name, not function signatures. The
+    /// adapter binds its world on each invocation, where incompatibilities are
+    /// returned as provider errors.
+    ///
+    /// Each successful cast retains the same guest instance and its state.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// if let Some(library) = plugin.cast::<bottles_plugin_host::Library>() {
+    ///     bottles.library().register_provider(std::sync::Arc::new(library));
+    /// }
+    /// ```
     pub fn cast<C: Capability>(&self) -> Option<Plugin<C>> {
         self.exports(C::INTERFACE).then(|| Plugin {
             shared: self.shared.clone(),

@@ -7,6 +7,29 @@ use bottles_core::{
 use crate::{Capability, Plugin, PluginInterface, plugin::call};
 
 /// Marker for plugins that export the library-provider interface.
+///
+/// [`Plugin<Library>`] implements [`bottles_core::LibraryProvider`], using the
+/// manifest ID as its provider ID. Listing queries the guest's current state.
+/// Launch returns a lazy [`Operation`] that queues its guest call when polled;
+/// it does not emit progress updates.
+///
+/// The operation retains a call sender and can outlive the plugin handle.
+/// Cancellation can end the wait with [`Error::Cancelled`], but does not
+/// withdraw an already queued guest call. Binding, driver, and
+/// guest failures become [`Error::LibraryProvider`].
+///
+/// # Examples
+///
+/// ```text
+/// use bottles_core::LibraryProvider;
+///
+/// if let Some(library) = plugin.cast::<bottles_plugin_host::Library>() {
+///     for entry in library.list_entries().await? {
+///         println!("{}: {}", entry.id, entry.title);
+///     }
+///     library.launch("entry-id")?.await?;
+/// }
+/// ```
 pub struct Library;
 
 impl Capability for Library {

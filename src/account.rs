@@ -12,6 +12,25 @@ use crate::{
 };
 
 /// Marker for plugins that export the account-provider interface.
+///
+/// [`Plugin<Account>`] implements [`bottles_core::AccountProvider`]. Its metadata
+/// comes from the manifest. Account linking forwards input requests to the
+/// caller's [`AccountLinkInteraction`] and returns the guest's identity and
+/// optional credential unchanged.
+///
+/// The interaction remains in the driver's resource table until the queued
+/// invocation finishes, even if its caller stops awaiting it. The resource is
+/// removed after the guest returns, including when the call returns an error;
+/// shutting down the driver drops its table and any remaining interactions.
+/// Binding, driver, and guest failures are returned as error strings.
+///
+/// # Examples
+///
+/// ```text
+/// if let Some(account) = plugin.cast::<bottles_plugin_host::Account>() {
+///     bottles.profiles().register_provider(std::sync::Arc::new(account));
+/// }
+/// ```
 pub struct Account;
 
 impl Capability for Account {
