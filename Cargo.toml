@@ -16,7 +16,7 @@ serde.workspace = true
 toml = "0.9.10"
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 url.workspace = true
-wasmtime = { version = "49", default-features = false, features = ["async", "component-model", "component-model-async", "cranelift"] }
+wasmtime = { version = "49", default-features = false, features = ["async", "cache", "component-model", "component-model-async", "cranelift"] }
 wasmtime-wasi = { version = "49", default-features = false, features = ["p3"] }
 wasmtime-wasi-http = { version = "49", default-features = false, features = ["default-send-request", "p3"] }
 

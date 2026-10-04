@@ -17,7 +17,7 @@ use bottles_core::Bottles;
 use bottles_plugin_host::{Account, Library, Plugins};
 
 async fn register_plugins(bottles: &Bottles) -> wasmtime::Result<()> {
-    let plugins = Plugins::new(bottles.directories().plugins())?;
+    let plugins = Plugins::new(bottles.directories())?;
     for manifest in plugins.list()? {
         let plugin = plugins.load(&manifest.id).await?;
         if let Some(account) = plugin.cast::<Account>() {
@@ -75,7 +75,10 @@ to exist. Package IDs are joined directly to the catalog path.
 
 Installation and removal affect files. Loaded instances and registered providers
 keep their state until their handles are released. Each [`Plugins::load`] call
-creates a separate instance; there is no cache of loaded packages.
+creates a separate instance. Wasmtime's disk cache reuses compiled components
+across loads and launches, with invalidation handled by Wasmtime. The CLI and UI
+share the `wasmtime` directory under Bottles' cache directory. Guest instance
+state is not cached.
 
 ## Execution and lifetime
 

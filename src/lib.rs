@@ -21,23 +21,25 @@ pub use library::Library;
 pub use manifest::Manifest;
 pub use plugin::{Capability, Plugin};
 
+use bottles_core::Directories;
 use std::{
     fs,
     path::{Path, PathBuf},
 };
-use wasmtime::{Engine, component::Linker};
+use wasmtime::{Cache, CacheConfig, Engine, component::Linker};
 
 use plugin::WasiState;
 
 /// Manages package files and the engine used to load their components.
 ///
-/// Packages live at `root/<id>/plugin.toml` and `root/<id>/plugin.wasm`.
+/// Packages live under [`Directories::plugins`] at `<id>/plugin.toml` and
+/// `<id>/plugin.wasm`.
 /// The catalog does not retain loaded handles or register providers with core.
 ///
 /// # Examples
 ///
 /// ```text
-/// let plugins = bottles_plugin_host::Plugins::new("plugins")?;
+/// let plugins = bottles_plugin_host::Plugins::new(bottles.directories())?;
 /// for manifest in plugins.list()? {
 ///     println!("{}: {}", manifest.id, manifest.name);
 /// }
@@ -49,30 +51,35 @@ pub struct Plugins {
 }
 
 impl Plugins {
-    /// Creates the shared engine and linker.
+    /// Creates the shared engine, linker, and persistent compilation cache.
     ///
-    /// Adds WASIp3, outbound HTTP, and account input imports. This does not read
-    /// or create `root`; filesystem access starts with the package methods.
+    /// Adds WASIp3, outbound HTTP, and account input imports. Packages are loaded
+    /// from [`Directories::plugins`]. Compiled components are cached across
+    /// launches in the `wasmtime` subdirectory of [`Directories::cache_dir`].
+    /// Package filesystem access starts with the package methods.
     ///
     /// # Errors
     ///
-    /// Returns an error if the engine or host imports cannot be configured.
+    /// Returns an error if the cache, engine, or host imports cannot be configured.
     ///
     /// # Examples
     ///
     /// ```text
-    /// let plugins = bottles_plugin_host::Plugins::new("plugins")?;
+    /// let plugins = bottles_plugin_host::Plugins::new(bottles.directories())?;
     /// ```
-    pub fn new(root: impl Into<PathBuf>) -> wasmtime::Result<Self> {
+    pub fn new(directories: &Directories) -> wasmtime::Result<Self> {
+        let mut cache = CacheConfig::new();
+        cache.with_directory(directories.cache_dir().join("wasmtime"));
         let mut config = wasmtime::Config::new();
         config.wasm_component_model_async(true);
+        config.cache(Some(Cache::new(cache)?));
         let engine = Engine::new(&config)?;
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::p3::add_to_linker(&mut linker)?;
         wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
         account::add_to_linker(&mut linker)?;
         Ok(Self {
-            root: root.into(),
+            root: directories.plugins(),
             engine,
             linker,
         })
