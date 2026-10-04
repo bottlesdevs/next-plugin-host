@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::{fs, path::Path};
+use wasmtime::error::Context;
 
 /// Identity and display metadata shipped beside a plugin component.
 ///
@@ -28,6 +29,10 @@ pub struct Manifest {
 
 impl Manifest {
     pub(crate) fn read(path: &Path) -> wasmtime::Result<Self> {
-        Ok(toml::from_str(&fs::read_to_string(path)?)?)
+        let source = fs::read_to_string(path)
+            .with_context(|| format!("failed to read plugin manifest {}", path.display()))?;
+
+        toml::from_str(&source)
+            .with_context(|| format!("failed to read plugin manifest {}", path.display()))
     }
 }
