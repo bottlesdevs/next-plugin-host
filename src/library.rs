@@ -1,56 +1,108 @@
-//! Typed calls for installed, launchable plugin entries.
+use async_trait::async_trait;
+use bottles_core::{
+    LibraryEntry, LibraryProvider, Operation,
+    error::{Error, Result},
+};
 
-use crate::LoadedPlugin;
+use crate::{Capability, Plugin, PluginInterface, plugin::call};
+
+/// Marker for plugins that export the library-provider interface.
+///
+/// [`Plugin<Library>`] implements [`bottles_core::LibraryProvider`], using the
+/// manifest ID as its provider ID. Listing queries the guest's current state.
+/// Launch returns a lazy [`Operation`] that queues its guest call when polled;
+/// it does not emit progress updates.
+///
+/// The operation retains a call sender and can outlive the plugin handle.
+/// Cancellation can end the wait with [`Error::Cancelled`], but does not
+/// withdraw an already queued guest call. Binding, driver, and
+/// guest failures become [`Error::LibraryProvider`].
+///
+/// # Examples
+///
+/// ```text
+/// use bottles_core::LibraryProvider;
+///
+/// if let Some(library) = plugin.cast::<bottles_plugin_host::Library>() {
+///     for entry in library.list_entries().await? {
+///         println!("{}: {}", entry.id, entry.title);
+///     }
+///     library.launch("entry-id")?.await?;
+/// }
+/// ```
+pub struct Library;
+
+impl Capability for Library {
+    const INTERFACE: PluginInterface = PluginInterface::LibraryProvider;
+}
 
 mod bindings {
     wasmtime::component::bindgen!({
         path: "../next-plugin-api/wit",
         world: "library",
-        additional_derives: [serde::Serialize, serde::Deserialize, PartialEq, Eq],
-        exports: { default: async },
+        exports: { default: async | store },
     });
 }
 
-use bindings::exports::bottles::plugin::library_provider;
-pub use library_provider::LibraryEntry;
-type Result<T> = std::result::Result<T, String>;
+#[async_trait]
+impl LibraryProvider for Plugin<Library> {
+    fn id(&self) -> &str {
+        &self.manifest().id
+    }
 
-/// Enumerates entries using the plugin's current state.
-pub async fn list_entries(plugin: &LoadedPlugin) -> Result<Vec<LibraryEntry>> {
-    plugin
-        .worker
-        .call(move |invocation| {
+    async fn list_entries(&self) -> Result<Vec<LibraryEntry>> {
+        call(&self.shared.calls, |accessor, instance| {
             Box::pin(async move {
-                let guest = match library_provider::GuestIndices::new(&invocation.component)
-                    .and_then(|indices| indices.load(&mut invocation.store, &invocation.instance))
-                {
-                    Ok(guest) => guest,
-                    Err(error) => return Ok(Err(error.to_string())),
-                };
-                guest.call_list_entries(&mut invocation.store).await
+                let bindings =
+                    accessor.with(|mut access| bindings::Library::new(&mut access, instance))?;
+                bindings
+                    .bottles_plugin_library_provider()
+                    .call_list_entries(accessor)
+                    .await
             })
         })
         .await
-        .map_err(|error| error.to_string())?
-}
-
-/// Awaits the launch request, not the lifetime of the launched title.
-/// Dropping this future does not cancel an invocation already accepted by the worker.
-pub async fn launch(plugin: &LoadedPlugin, entry_id: &str) -> Result<()> {
-    let entry_id = entry_id.to_owned();
-    plugin
-        .worker
-        .call(move |invocation| {
-            Box::pin(async move {
-                let guest = match library_provider::GuestIndices::new(&invocation.component)
-                    .and_then(|indices| indices.load(&mut invocation.store, &invocation.instance))
-                {
-                    Ok(guest) => guest,
-                    Err(error) => return Ok(Err(error.to_string())),
-                };
-                guest.call_launch(&mut invocation.store, &entry_id).await
-            })
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| LibraryEntry {
+                    id: entry.id,
+                    title: entry.title,
+                })
+                .collect()
         })
-        .await
-        .map_err(|error| error.to_string())?
+        .map_err(|message| Error::LibraryProvider {
+            provider: self.id().to_owned(),
+            message,
+        })
+    }
+
+    fn launch(&self, entry_id: &str) -> Result<Operation<()>> {
+        let calls = self.shared.calls.clone();
+        let provider_id = self.id().to_owned();
+        let entry_id = entry_id.to_owned();
+        Ok(Operation::new(move |_, cancellation| async move {
+            cancellation
+                .run_until_cancelled(call(&calls, move |accessor, instance| {
+                    Box::pin(async move {
+                        let bindings = accessor
+                            .with(|mut access| bindings::Library::new(&mut access, instance))?;
+                        bindings
+                            .bottles_plugin_library_provider()
+                            .call_launch(accessor, entry_id)
+                            .await
+                    })
+                }))
+                .await
+                .ok_or(Error::Cancelled)?
+                .map_err(|error| error.to_string())
+                .and_then(|result| result)
+                .map_err(|message| Error::LibraryProvider {
+                    provider: provider_id,
+                    message,
+                })
+        }))
+    }
 }

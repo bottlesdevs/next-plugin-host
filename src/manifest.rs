@@ -1,21 +1,33 @@
-use semver::Version;
-use serde::{Deserialize, Serialize};
-
-use crate::PluginError;
+use serde::Deserialize;
+use std::{fs, path::Path};
 
 /// Identity and display metadata shipped beside a plugin component.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PluginManifest {
-    pub schema_version: u32,
+///
+/// Read from `plugin.toml` by [`crate::Plugins`]. The ID is used for package
+/// paths and core provider registration; the version is display metadata,
+/// separate from the versioned WIT interface names.
+///
+/// # Examples
+///
+/// ```text
+/// let manifest = bottles_plugin_host::Manifest {
+///     id: "example".into(),
+///     name: "Example provider".into(),
+///     version: "0.1.0".into(),
+/// };
+/// ```
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct Manifest {
+    /// Package identifier used directly in catalog paths and provider IDs.
     pub id: String,
+    /// Display name used in account provider metadata.
     pub name: String,
-    pub version: Version,
-    pub description: String,
-    pub authors: Vec<String>,
-    pub license: String,
-    pub repository: url::Url,
+    /// Display version, independent of WIT interface versions.
+    pub version: String,
 }
 
-pub fn parse_manifest(source: &str) -> Result<PluginManifest, PluginError> {
-    Ok(toml::from_str(source)?)
+impl Manifest {
+    pub(crate) fn read(path: &Path) -> wasmtime::Result<Self> {
+        Ok(toml::from_str(&fs::read_to_string(path)?)?)
+    }
 }

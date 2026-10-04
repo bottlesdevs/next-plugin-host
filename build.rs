@@ -19,14 +19,44 @@ fn main() {
     }
 
     let mut source = String::from(
-        "/// Known exported interfaces, generated from the SDK's WIT worlds.\n\
-         #[derive(Clone, Copy, Debug, Eq, PartialEq)]\n\
-         pub enum PluginInterface {\n",
+        r#"/// Names the provider interfaces exported by the SDK's WIT worlds.
+///
+/// Used by [`crate::Capability::INTERFACE`] to select the export required
+/// by a typed [`crate::Plugin`] handle. [`Self::as_str`] returns the exact
+/// versioned name used in component exports.
+///
+/// # Examples
+///
+/// ```text
+/// use bottles_plugin_host::{Capability, Library};
+///
+/// let name = <Library as Capability>::INTERFACE.as_str();
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PluginInterface {
+"#,
     );
-    for variant in interfaces.values() {
+    for (name, variant) in &interfaces {
+        writeln!(source, "    /// Identifies the `{name}` export.").unwrap();
         writeln!(source, "    {variant},").unwrap();
     }
-    source.push_str("}\nimpl PluginInterface {\n    pub const fn as_str(self) -> &'static str {\n        match self {\n");
+    source.push_str(
+        r#"}
+impl PluginInterface {
+    /// Returns the exact versioned WIT interface name.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// use bottles_plugin_host::PluginInterface;
+    ///
+    /// let name = PluginInterface::LibraryProvider.as_str();
+    /// // name is "bottles:plugin/library-provider@0.1.0"
+    /// ```
+    pub const fn as_str(self) -> &'static str {
+        match self {
+"#,
+    );
     for (name, variant) in &interfaces {
         writeln!(source, "            Self::{variant} => {name:?},").unwrap();
     }
