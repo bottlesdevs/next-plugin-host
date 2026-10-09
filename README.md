@@ -32,19 +32,28 @@ async fn register_plugins(bottles: &Bottles) -> wasmtime::Result<()> {
 ```
 
 Typed handles implement [`bottles_core::AccountProvider`] and
-[`bottles_core::LibraryProvider`]. They share the loaded guest instance, so state
-created during account linking can be used by subsequent library calls. A cast
-checks the versioned export name; bindings are constructed when a provider method
-is invoked, and missing or incompatible functions fail at that point.
+[`bottles_core::LibraryProvider`]. Each cast attaches a new capability value; the
+handles share the loaded guest instance, so state created during account linking
+can be used by subsequent library calls. A cast checks the versioned export name;
+bindings are constructed for queued guest calls, and missing or incompatible
+functions fail at that point.
 
-Core's library registry returns items whose launch operations must be polled:
+Casting a library capability starts one listing on its driver. All entry
+watchers of that handle share a channel containing the current listing: `Loading`
+until the guest answers, then `Loaded` or `Failed`. Resubscribing yields that state
+immediately without another guest call. A separate cast starts a separate listing;
+plugin listings are not refreshed automatically.
+
+Core's library registry launches entries by provider and entry ID. The returned
+operation must be polled:
 
 ```text
-async fn launch_first(bottles: &bottles_core::Bottles) -> bottles_core::error::Result<()> {
-    if let Some(item) = bottles.library().list().await?.first() {
-        item.launch()?.await?;
-    }
-    Ok(())
+async fn launch_entry(
+    bottles: &bottles_core::Bottles,
+    provider: &str,
+    entry: &str,
+) -> bottles_core::error::Result<()> {
+    bottles.library().launch(provider, entry)?.await
 }
 ```
 
