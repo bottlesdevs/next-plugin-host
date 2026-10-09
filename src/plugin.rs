@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use futures::{
     future::BoxFuture,
@@ -39,7 +39,7 @@ impl WasiHttpView for WasiState {
     }
 }
 
-type Call =
+pub(crate) type Call =
     Box<dyn for<'a> FnOnce(&'a Accessor<WasiState>, &'a Instance) -> BoxFuture<'a, ()> + Send>;
 
 pub(crate) struct Shared {
@@ -51,8 +51,8 @@ pub(crate) struct Shared {
 /// Holds a loaded guest instance shared by its capability handles.
 ///
 /// [`crate::Plugins::load`] returns `Plugin<()>`. Use [`cast`](Plugin::cast) to
-/// obtain a typed handle implementing a core provider trait. Casting shares
-/// the store and guest state; it does not instantiate another component.
+/// obtain a typed handle implementing a core provider trait. Each cast attaches
+/// new capability state while sharing the same store and guest instance.
 ///
 /// Handles and pending launch operations retain the driver's call channel.
 /// The driver exits when it observes that all senders have been dropped.
@@ -66,14 +66,15 @@ pub(crate) struct Shared {
 /// ```
 pub struct Plugin<C = ()> {
     pub(crate) shared: Arc<Shared>,
-    capability: PhantomData<fn() -> C>,
+    pub(crate) capability: C,
 }
 
 /// Links a capability to the exported interface it requires.
 ///
-/// [`crate::Account`] and [`crate::Library`] are the built-in markers. This
-/// mapping controls export discovery; provider implementations are supplied
-/// separately for their corresponding typed [`Plugin`] handles.
+/// [`crate::Account`] and [`crate::Library`] are the built-in capabilities. Each
+/// value owns its capability state and is attached to a shared guest instance by
+/// [`Plugin::cast`]. Provider implementations are supplied for the corresponding
+/// typed [`Plugin`] handles.
 ///
 /// # Examples
 ///
@@ -83,9 +84,15 @@ pub struct Plugin<C = ()> {
 /// let interface = <Library as Capability>::INTERFACE;
 /// let name = interface.as_str(); // "bottles:plugin/library-provider@0.1.0"
 /// ```
-pub trait Capability {
+pub trait Capability: Sized {
     /// Names the versioned WIT interface required for a cast.
     const INTERFACE: PluginInterface;
+
+    /// Creates this capability's state for a plugin that exports [`Self::INTERFACE`].
+    ///
+    /// [`Plugin::cast`] calls this after checking the export, once per cast.
+    /// Obtain capabilities through `cast` instead of calling this directly.
+    fn new(plugin: &Plugin) -> Self;
 }
 
 impl<C> Plugin<C> {
@@ -120,7 +127,8 @@ impl Plugin {
     /// adapter binds its world on each invocation, where incompatibilities are
     /// returned as provider errors.
     ///
-    /// Each successful cast retains the same guest instance and its state.
+    /// Each successful cast attaches a new capability instance with
+    /// [`Capability::new`], retaining the same guest instance and its state.
     ///
     /// # Examples
     ///
@@ -132,7 +140,7 @@ impl Plugin {
     pub fn cast<C: Capability>(&self) -> Option<Plugin<C>> {
         self.exports(C::INTERFACE).then(|| Plugin {
             shared: self.shared.clone(),
-            capability: PhantomData,
+            capability: C::new(self),
         })
     }
 
@@ -168,7 +176,7 @@ impl Plugin {
                 component,
                 calls,
             }),
-            capability: PhantomData,
+            capability: (),
         })
     }
 }

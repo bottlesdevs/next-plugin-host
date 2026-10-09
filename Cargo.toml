@@ -15,6 +15,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 serde.workspace = true
 toml = "0.9.10"
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tokio-stream = { workspace = true, features = ["sync"] }
 url.workspace = true
 wasmtime = { version = "49", default-features = false, features = ["async", "cache", "component-model", "component-model-async", "cranelift"] }
 wasmtime-wasi = { version = "49", default-features = false, features = ["p3"] }
