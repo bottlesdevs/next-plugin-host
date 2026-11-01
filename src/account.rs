@@ -35,10 +35,6 @@ pub struct Account;
 
 impl Capability for Account {
     const INTERFACE: PluginInterface = PluginInterface::AccountProvider;
-
-    fn new(_: &Plugin) -> Self {
-        Account
-    }
 }
 
 mod bindings {
