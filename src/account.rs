@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bottles_core::{
-    AccountIdentity, AccountLinkInteraction, AccountProvider, AccountProviderInfo, LinkedAccount,
-};
 use wasmtime::component::{Accessor, HasSelf, Linker, Resource};
 
 use crate::{
@@ -11,12 +8,18 @@ use crate::{
     plugin::{Plugin, WasiState, call},
 };
 
+/// Supplies user input requested by a plugin during account linking.
+#[async_trait]
+pub trait Interaction: Send + Sync {
+    /// Shows `url` with `instructions` and returns the user's input.
+    async fn request_input(&self, url: url::Url, instructions: String) -> Result<String, String>;
+}
+
 /// Marker for plugins that export the account-provider interface.
 ///
-/// [`Plugin<Account>`] implements [`bottles_core::AccountProvider`]. Its metadata
-/// comes from the manifest. Account linking forwards input requests to the
-/// caller's [`AccountLinkInteraction`] and returns the guest's identity and
-/// optional credential unchanged.
+/// [`Plugin<Account>`] links an account by forwarding the guest's input requests
+/// to the caller's [`Interaction`] and returns the guest's identity and optional
+/// credential unchanged.
 ///
 /// The interaction remains in the driver's resource table until the queued
 /// invocation finishes, even if its caller stops awaiting it. The resource is
@@ -28,7 +31,8 @@ use crate::{
 ///
 /// ```text
 /// if let Some(account) = plugin.cast::<bottles_plugin_host::Account>() {
-///     bottles.profiles().register_provider(std::sync::Arc::new(account));
+///     let linked = account.link_account(interaction).await?;
+///     println!("{}", linked.identity.display_name);
 /// }
 /// ```
 pub struct Account;
@@ -37,8 +41,9 @@ impl Capability for Account {
     const INTERFACE: PluginInterface = PluginInterface::AccountProvider;
 }
 
+#[allow(missing_docs)]
 mod bindings {
-    pub type Interaction = std::sync::Arc<dyn bottles_core::AccountLinkInteraction>;
+    pub type Interaction = std::sync::Arc<dyn super::Interaction>;
 
     wasmtime::component::bindgen!({
         path: "../next-plugin-api/wit",
@@ -58,7 +63,7 @@ pub(crate) fn add_to_linker(linker: &mut Linker<WasiState>) -> wasmtime::Result<
 impl<T: Send + 'static> account_link::HostInteractionWithStore<T> for HasSelf<WasiState> {
     async fn request_input(
         accessor: &Accessor<T, Self>,
-        interaction: Resource<Arc<dyn AccountLinkInteraction>>,
+        interaction: Resource<Arc<dyn Interaction>>,
         url: String,
         instructions: String,
     ) -> wasmtime::Result<Result<String, String>> {
@@ -73,10 +78,7 @@ impl<T: Send + 'static> account_link::HostInteractionWithStore<T> for HasSelf<Wa
 }
 
 impl account_link::HostInteraction for WasiState {
-    fn drop(
-        &mut self,
-        interaction: Resource<Arc<dyn AccountLinkInteraction>>,
-    ) -> wasmtime::Result<()> {
+    fn drop(&mut self, interaction: Resource<Arc<dyn Interaction>>) -> wasmtime::Result<()> {
         self.table.delete(interaction)?;
         Ok(())
     }
@@ -84,19 +86,22 @@ impl account_link::HostInteraction for WasiState {
 
 impl account_link::Host for WasiState {}
 
-#[async_trait]
-impl AccountProvider for Plugin<Account> {
-    fn metadata(&self) -> AccountProviderInfo {
-        AccountProviderInfo {
-            id: self.manifest().id.clone(),
-            name: self.manifest().name.clone().into(),
-        }
-    }
+/// Public identity reported by an account plugin.
+pub use bindings::exports::bottles::plugin::account_provider::AccountIdentity;
+/// An account identity and the optional private credential returned by linking.
+pub use bindings::exports::bottles::plugin::account_provider::LinkedAccount;
 
-    async fn link_account(
+impl Plugin<Account> {
+    /// Runs the guest's account-link flow using `interaction` for user input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver is closed, the bindings cannot be
+    /// constructed, or the guest reports a failure.
+    pub async fn link_account(
         &self,
-        interaction: Arc<dyn AccountLinkInteraction>,
-    ) -> Result<LinkedAccount, String> {
+        interaction: Arc<dyn Interaction>,
+    ) -> wasmtime::Result<LinkedAccount> {
         call(&self.shared.calls, move |accessor, instance| {
             Box::pin(async move {
                 let bindings =
@@ -112,14 +117,7 @@ impl AccountProvider for Plugin<Account> {
                 result
             })
         })
-        .await
-        .map_err(|error| error.to_string())?
-        .map(|linked| LinkedAccount {
-            identity: AccountIdentity {
-                account_id: linked.identity.account_id,
-                display_name: linked.identity.display_name,
-            },
-            credential: linked.credential,
-        })
+        .await?
+        .map_err(wasmtime::Error::msg)
     }
 }

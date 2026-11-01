@@ -1,33 +1,20 @@
-use async_trait::async_trait;
-use bottles_core::{
-    LibraryEntry, LibraryProvider, Operation,
-    error::{Error, Result},
-};
-
 use crate::{Capability, Plugin, PluginInterface, plugin::call};
 
 /// Marker for plugins that export the library-provider interface.
 ///
-/// [`Plugin<Library>`] implements [`bottles_core::LibraryProvider`], using the
-/// manifest ID as its provider ID. Listing queries the guest's current state.
-/// Launch returns a lazy [`Operation`] that queues its guest call when polled;
-/// it does not emit progress updates.
-///
-/// The operation retains a call sender and can outlive the plugin handle.
-/// Cancellation can end the wait with [`Error::Cancelled`], but does not
-/// withdraw an already queued guest call. Binding, driver, and
-/// guest failures become [`Error::LibraryProvider`].
+/// [`Plugin<Library>`] lists the guest's current entries and forwards launch
+/// requests. Each call is queued to the plugin's driver; dropping the returned
+/// future stops waiting but does not withdraw an already queued guest call.
+/// Binding, driver, and guest failures are returned as errors.
 ///
 /// # Examples
 ///
 /// ```text
-/// use bottles_core::LibraryProvider;
-///
 /// if let Some(library) = plugin.cast::<bottles_plugin_host::Library>() {
 ///     for entry in library.list_entries().await? {
 ///         println!("{}: {}", entry.id, entry.title);
 ///     }
-///     library.launch("entry-id")?.await?;
+///     library.launch("entry-id").await?;
 /// }
 /// ```
 pub struct Library;
@@ -36,6 +23,7 @@ impl Capability for Library {
     const INTERFACE: PluginInterface = PluginInterface::LibraryProvider;
 }
 
+#[allow(missing_docs)]
 mod bindings {
     wasmtime::component::bindgen!({
         path: "../next-plugin-api/wit",
@@ -44,13 +32,20 @@ mod bindings {
     });
 }
 
-#[async_trait]
-impl LibraryProvider for Plugin<Library> {
-    fn id(&self) -> &str {
-        &self.manifest().id
-    }
+/// One installed title reported by a library plugin.
+///
+/// `id` is local to the plugin and is passed back unchanged to
+/// [`Plugin::<Library>::launch`].
+pub use bindings::exports::bottles::plugin::library_provider::LibraryEntry;
 
-    async fn list_entries(&self) -> Result<Vec<LibraryEntry>> {
+impl Plugin<Library> {
+    /// Asks the guest for its current installed, launchable titles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver is closed, the bindings cannot be
+    /// constructed, or the guest reports a failure.
+    pub async fn list_entries(&self) -> wasmtime::Result<Vec<LibraryEntry>> {
         call(&self.shared.calls, |accessor, instance| {
             Box::pin(async move {
                 let bindings =
@@ -61,48 +56,31 @@ impl LibraryProvider for Plugin<Library> {
                     .await
             })
         })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result)
-        .map(|entries| {
-            entries
-                .into_iter()
-                .map(|entry| LibraryEntry {
-                    id: entry.id,
-                    title: entry.title,
-                })
-                .collect()
-        })
-        .map_err(|message| Error::LibraryProvider {
-            provider: self.id().to_owned(),
-            message,
-        })
+        .await?
+        .map_err(wasmtime::Error::msg)
     }
 
-    fn launch(&self, entry_id: &str) -> Result<Operation<()>> {
-        let calls = self.shared.calls.clone();
-        let provider_id = self.id().to_owned();
+    /// Asks the guest to launch an entry returned by [`Self::list_entries`].
+    ///
+    /// Completion means the launch request finished, not that the title exited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver is closed, the bindings cannot be
+    /// constructed, or the guest reports a failure.
+    pub async fn launch(&self, entry_id: &str) -> wasmtime::Result<()> {
         let entry_id = entry_id.to_owned();
-        Ok(Operation::new(move |_, cancellation| async move {
-            cancellation
-                .run_until_cancelled(call(&calls, move |accessor, instance| {
-                    Box::pin(async move {
-                        let bindings = accessor
-                            .with(|mut access| bindings::Library::new(&mut access, instance))?;
-                        bindings
-                            .bottles_plugin_library_provider()
-                            .call_launch(accessor, entry_id)
-                            .await
-                    })
-                }))
-                .await
-                .ok_or(Error::Cancelled)?
-                .map_err(|error| error.to_string())
-                .and_then(|result| result)
-                .map_err(|message| Error::LibraryProvider {
-                    provider: provider_id,
-                    message,
-                })
-        }))
+        call(&self.shared.calls, move |accessor, instance| {
+            Box::pin(async move {
+                let bindings =
+                    accessor.with(|mut access| bindings::Library::new(&mut access, instance))?;
+                bindings
+                    .bottles_plugin_library_provider()
+                    .call_launch(accessor, entry_id)
+                    .await
+            })
+        })
+        .await?
+        .map_err(wasmtime::Error::msg)
     }
 }

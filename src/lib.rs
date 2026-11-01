@@ -2,9 +2,9 @@
 #![warn(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-/// Adapts account exports and host input interactions to core's account provider.
+/// Links accounts through account exports and caller-supplied input interactions.
 mod account;
-/// Adapts library exports to core's library provider and lazy launch operations.
+/// Lists and launches entries through library exports.
 mod library;
 /// Reads the metadata stored beside a component.
 mod manifest;
@@ -15,9 +15,9 @@ mod interfaces {
     include!(concat!(env!("OUT_DIR"), "/plugin_interfaces.rs"));
 }
 
-pub use account::Account;
+pub use account::{Account, AccountIdentity, Interaction, LinkedAccount};
 pub use interfaces::PluginInterface;
-pub use library::Library;
+pub use library::{Library, LibraryEntry};
 pub use manifest::Manifest;
 pub use plugin::{Capability, Plugin};
 
@@ -34,7 +34,7 @@ use plugin::WasiState;
 ///
 /// Packages live under [`Directories::plugins`] at `<id>/plugin.toml` and
 /// `<id>/plugin.wasm`.
-/// The catalog does not retain loaded handles or register providers with core.
+/// The catalog does not retain loaded handles.
 ///
 /// # Examples
 ///
@@ -165,7 +165,7 @@ impl Plugins {
     ///
     /// Reads the manifest, compiles the component, and instantiates it before
     /// returning. Every load creates a new guest instance; casts of the returned
-    /// handle share that instance. Loading does not register providers.
+    /// handle share that instance.
     ///
     /// # Errors
     ///
@@ -179,7 +179,7 @@ impl Plugins {
     /// ```text
     /// let plugin = plugins.load("example").await?;
     /// if let Some(library) = plugin.cast::<bottles_plugin_host::Library>() {
-    ///     bottles.library().register_provider(std::sync::Arc::new(library));
+    ///     let entries = library.list_entries().await?;
     /// }
     /// ```
     pub async fn load(&self, id: &str) -> wasmtime::Result<Plugin> {

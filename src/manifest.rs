@@ -5,7 +5,7 @@ use wasmtime::error::Context;
 /// Identity and display metadata shipped beside a plugin component.
 ///
 /// Read from `plugin.toml` by [`crate::Plugins`]. The ID is used for package
-/// paths and core provider registration; the version is display metadata,
+/// paths and to identify the plugin to callers; the version is display metadata,
 /// separate from the versioned WIT interface names.
 ///
 /// # Examples
