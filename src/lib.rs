@@ -21,31 +21,27 @@ pub use library::{Library, LibraryEntry};
 pub use manifest::Manifest;
 pub use plugin::{Capability, Plugin};
 
-use bottles_core::Directories;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use next_paths::plugins_dir;
+use std::{fs, path::Path};
 use wasmtime::{Cache, CacheConfig, Engine, component::Linker};
 
 use plugin::WasiState;
 
 /// Manages package files and the engine used to load their components.
 ///
-/// Packages live under [`Directories::plugins`] at `<id>/plugin.toml` and
-/// `<id>/plugin.wasm`.
+/// Packages live under the application's plugins directory at
+/// `<id>/plugin.toml` and `<id>/plugin.wasm`.
 /// The catalog does not retain loaded handles.
 ///
 /// # Examples
 ///
 /// ```text
-/// let plugins = bottles_plugin_host::Plugins::new(bottles.directories())?;
+/// let plugins = bottles_plugin_host::Plugins::new()?;
 /// for manifest in plugins.list()? {
 ///     println!("{}: {}", manifest.id, manifest.name);
 /// }
 /// ```
 pub struct Plugins {
-    root: PathBuf,
     engine: Engine,
     linker: Linker<WasiState>,
 }
@@ -54,8 +50,8 @@ impl Plugins {
     /// Creates the shared engine, linker, and persistent compilation cache.
     ///
     /// Adds WASIp3, outbound HTTP, and account input imports. Packages are loaded
-    /// from [`Directories::plugins`]. Compiled components are cached across
-    /// launches in the `wasmtime` subdirectory of [`Directories::cache_dir`].
+    /// from the application's plugins directory. Compiled components are cached
+    /// across launches in the `wasmtime` subdirectory of its cache directory.
     /// Package filesystem access starts with the package methods.
     ///
     /// # Errors
@@ -65,11 +61,11 @@ impl Plugins {
     /// # Examples
     ///
     /// ```text
-    /// let plugins = bottles_plugin_host::Plugins::new(bottles.directories())?;
+    /// let plugins = bottles_plugin_host::Plugins::new()?;
     /// ```
-    pub fn new(directories: &Directories) -> wasmtime::Result<Self> {
+    pub fn new() -> wasmtime::Result<Self> {
         let mut cache = CacheConfig::new();
-        cache.with_directory(directories.cache_dir().join("wasmtime"));
+        cache.with_directory(next_paths::cache_dir().join("wasmtime"));
         let mut config = wasmtime::Config::new();
         config.wasm_component_model_async(true);
         config.cache(Some(Cache::new(cache)?));
@@ -78,11 +74,7 @@ impl Plugins {
         wasmtime_wasi::p3::add_to_linker(&mut linker)?;
         wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
         account::add_to_linker(&mut linker)?;
-        Ok(Self {
-            root: directories.plugins(),
-            engine,
-            linker,
-        })
+        Ok(Self { engine, linker })
     }
 
     /// Reads the manifests of installed packages.
@@ -105,7 +97,7 @@ impl Plugins {
     /// ```
     pub fn list(&self) -> wasmtime::Result<Vec<Manifest>> {
         let mut manifests = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
+        for entry in fs::read_dir(plugins_dir())? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 let manifest = Manifest::read(&entry.path().join("plugin.toml"))?;
@@ -135,7 +127,7 @@ impl Plugins {
     /// ```
     pub fn install(&self, source: &Path) -> wasmtime::Result<Manifest> {
         let manifest = Manifest::read(&source.join("plugin.toml"))?;
-        let directory = self.root.join(&manifest.id);
+        let directory = plugins_dir().join(&manifest.id);
         fs::create_dir_all(&directory)?;
         fs::copy(source.join("plugin.toml"), directory.join("plugin.toml"))?;
         fs::copy(source.join("plugin.wasm"), directory.join("plugin.wasm"))?;
@@ -158,7 +150,7 @@ impl Plugins {
     /// plugins.uninstall("example")?;
     /// ```
     pub fn uninstall(&self, id: &str) -> wasmtime::Result<()> {
-        Ok(fs::remove_dir_all(self.root.join(id))?)
+        Ok(fs::remove_dir_all(plugins_dir().join(id))?)
     }
 
     /// Loads one package into a long-lived driver thread.
@@ -183,7 +175,7 @@ impl Plugins {
     /// }
     /// ```
     pub async fn load(&self, id: &str) -> wasmtime::Result<Plugin> {
-        let directory = self.root.join(id);
+        let directory = plugins_dir().join(id);
         let manifest = Manifest::read(&directory.join("plugin.toml"))?;
         Plugin::load(
             manifest,

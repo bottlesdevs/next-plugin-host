@@ -11,11 +11,10 @@ instances, and call the capabilities they want to offer.
 [`Plugin<Library>`], then keep the handles wherever the application needs them.
 
 ```text
-use bottles_core::Bottles;
 use bottles_plugin_host::{Library, Plugins};
 
-async fn list_plugin_entries(bottles: &Bottles) -> wasmtime::Result<()> {
-    let plugins = Plugins::new(bottles.directories())?;
+async fn list_plugin_entries() -> wasmtime::Result<()> {
+    let plugins = Plugins::new()?;
     for manifest in plugins.list()? {
         let plugin = plugins.load(&manifest.id).await?;
         if let Some(library) = plugin.cast::<Library>() {
