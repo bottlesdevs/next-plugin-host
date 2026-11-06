@@ -9,7 +9,7 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
-bottles-core.workspace = true
+next-paths.workspace = true
 async-trait.workspace = true
 futures = { version = "0.3", default-features = false, features = ["std"] }
 serde.workspace = true

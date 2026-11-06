@@ -2,9 +2,9 @@
 #![warn(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-/// Adapts account exports and host input interactions to core's account provider.
+/// Adapts account exports and application-owned input interactions.
 mod account;
-/// Adapts library exports to core's library provider and lazy launch operations.
+/// Adapts library exports and guest launch calls.
 mod library;
 /// Reads the metadata stored beside a component.
 mod manifest;
@@ -15,13 +15,12 @@ mod interfaces {
     include!(concat!(env!("OUT_DIR"), "/plugin_interfaces.rs"));
 }
 
-pub use account::Account;
+pub use account::{Account, AccountIdentity, Interaction, LinkedAccount};
 pub use interfaces::PluginInterface;
-pub use library::Library;
+pub use library::{Library, LibraryEntry};
 pub use manifest::Manifest;
 pub use plugin::{Capability, Plugin};
 
-use bottles_core::Directories;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -32,14 +31,14 @@ use plugin::WasiState;
 
 /// Manages package files and the engine used to load their components.
 ///
-/// Packages live under [`Directories::plugins`] at `<id>/plugin.toml` and
+/// Packages live under [`next_paths::plugins_dir`] at `<id>/plugin.toml` and
 /// `<id>/plugin.wasm`.
-/// The catalog does not retain loaded handles or register providers with core.
+/// The catalog does not retain loaded handles or register application providers.
 ///
 /// # Examples
 ///
 /// ```text
-/// let plugins = bottles_plugin_host::Plugins::new(bottles.directories())?;
+/// let plugins = bottles_plugin_host::Plugins::new()?;
 /// for manifest in plugins.list()? {
 ///     println!("{}: {}", manifest.id, manifest.name);
 /// }
@@ -54,8 +53,8 @@ impl Plugins {
     /// Creates the shared engine, linker, and persistent compilation cache.
     ///
     /// Adds WASIp3, outbound HTTP, and account input imports. Packages are loaded
-    /// from [`Directories::plugins`]. Compiled components are cached across
-    /// launches in the `wasmtime` subdirectory of [`Directories::cache_dir`].
+    /// from [`next_paths::plugins_dir`]. Compiled components are cached across
+    /// launches in the `wasmtime` subdirectory of [`next_paths::cache_dir`].
     /// Package filesystem access starts with the package methods.
     ///
     /// # Errors
@@ -65,11 +64,12 @@ impl Plugins {
     /// # Examples
     ///
     /// ```text
-    /// let plugins = bottles_plugin_host::Plugins::new(bottles.directories())?;
+    /// let plugins = bottles_plugin_host::Plugins::new()?;
     /// ```
-    pub fn new(directories: &Directories) -> wasmtime::Result<Self> {
+    pub fn new() -> wasmtime::Result<Self> {
+        fs::create_dir_all(next_paths::plugins_dir())?;
         let mut cache = CacheConfig::new();
-        cache.with_directory(directories.cache_dir().join("wasmtime"));
+        cache.with_directory(next_paths::cache_dir().join("wasmtime"));
         let mut config = wasmtime::Config::new();
         config.wasm_component_model_async(true);
         config.cache(Some(Cache::new(cache)?));
@@ -79,7 +79,7 @@ impl Plugins {
         wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
         account::add_to_linker(&mut linker)?;
         Ok(Self {
-            root: directories.plugins(),
+            root: next_paths::plugins_dir().to_owned(),
             engine,
             linker,
         })
@@ -145,7 +145,7 @@ impl Plugins {
     /// Removes an installed package.
     ///
     /// Recursively removes the path formed by joining `id` to the catalog
-    /// root. Loaded instances and core registrations are unaffected.
+    /// root. Loaded instances are unaffected.
     ///
     /// # Errors
     ///

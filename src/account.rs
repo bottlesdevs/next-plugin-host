@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bottles_core::{
-    AccountIdentity, AccountLinkInteraction, AccountProvider, AccountProviderInfo, LinkedAccount,
-};
 use wasmtime::component::{Accessor, HasSelf, Linker, Resource};
 
 use crate::{
@@ -11,26 +8,31 @@ use crate::{
     plugin::{Plugin, WasiState, call},
 };
 
-/// Marker for plugins that export the account-provider interface.
-///
-/// [`Plugin<Account>`] implements [`bottles_core::AccountProvider`]. Its metadata
-/// comes from the manifest. Account linking forwards input requests to the
-/// caller's [`AccountLinkInteraction`] and returns the guest's identity and
-/// optional credential unchanged.
-///
-/// The interaction remains in the driver's resource table until the queued
-/// invocation finishes, even if its caller stops awaiting it. The resource is
-/// removed after the guest returns, including when the call returns an error;
-/// shutting down the driver drops its table and any remaining interactions.
-/// Binding, driver, and guest failures are returned as error strings.
-///
-/// # Examples
-///
-/// ```text
-/// if let Some(account) = plugin.cast::<bottles_plugin_host::Account>() {
-///     bottles.profiles().register_provider(std::sync::Arc::new(account));
-/// }
-/// ```
+/// Input supplied by the application to an account-link invocation.
+#[async_trait]
+pub trait Interaction: Send + Sync {
+    /// Opens the provider URL and returns the requested input.
+    async fn request_input(&self, url: url::Url, instructions: String) -> Result<String, String>;
+}
+
+/// Public identity returned by an account plugin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountIdentity {
+    /// Provider-local account identifier.
+    pub account_id: String,
+    /// Human-readable account name.
+    pub display_name: String,
+}
+
+/// Account identity and optional opaque credential returned by the guest.
+pub struct LinkedAccount {
+    /// Public account identity.
+    pub identity: AccountIdentity,
+    /// Private credential; persistence belongs to the application.
+    pub credential: Option<Vec<u8>>,
+}
+
+/// Marker for plugins exporting the account-provider interface.
 pub struct Account;
 
 impl Capability for Account {
@@ -38,7 +40,7 @@ impl Capability for Account {
 }
 
 mod bindings {
-    pub type Interaction = std::sync::Arc<dyn bottles_core::AccountLinkInteraction>;
+    pub type Interaction = std::sync::Arc<dyn super::Interaction>;
 
     wasmtime::component::bindgen!({
         path: "../next-plugin-api/wit",
@@ -58,7 +60,7 @@ pub(crate) fn add_to_linker(linker: &mut Linker<WasiState>) -> wasmtime::Result<
 impl<T: Send + 'static> account_link::HostInteractionWithStore<T> for HasSelf<WasiState> {
     async fn request_input(
         accessor: &Accessor<T, Self>,
-        interaction: Resource<Arc<dyn AccountLinkInteraction>>,
+        interaction: Resource<Arc<dyn Interaction>>,
         url: String,
         instructions: String,
     ) -> wasmtime::Result<Result<String, String>> {
@@ -73,10 +75,7 @@ impl<T: Send + 'static> account_link::HostInteractionWithStore<T> for HasSelf<Wa
 }
 
 impl account_link::HostInteraction for WasiState {
-    fn drop(
-        &mut self,
-        interaction: Resource<Arc<dyn AccountLinkInteraction>>,
-    ) -> wasmtime::Result<()> {
+    fn drop(&mut self, interaction: Resource<Arc<dyn Interaction>>) -> wasmtime::Result<()> {
         self.table.delete(interaction)?;
         Ok(())
     }
@@ -84,18 +83,11 @@ impl account_link::HostInteraction for WasiState {
 
 impl account_link::Host for WasiState {}
 
-#[async_trait]
-impl AccountProvider for Plugin<Account> {
-    fn metadata(&self) -> AccountProviderInfo {
-        AccountProviderInfo {
-            id: self.manifest().id.clone(),
-            name: self.manifest().name.clone().into(),
-        }
-    }
-
-    async fn link_account(
+impl Plugin<Account> {
+    /// Runs the guest account-link flow with the supplied input handler.
+    pub async fn link_account(
         &self,
-        interaction: Arc<dyn AccountLinkInteraction>,
+        interaction: Arc<dyn Interaction>,
     ) -> Result<LinkedAccount, String> {
         call(&self.shared.calls, move |accessor, instance| {
             Box::pin(async move {

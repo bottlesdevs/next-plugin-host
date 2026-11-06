@@ -51,7 +51,7 @@ pub(crate) struct Shared {
 /// Holds a loaded guest instance shared by its capability handles.
 ///
 /// [`crate::Plugins::load`] returns `Plugin<()>`. Use [`cast`](Plugin::cast) to
-/// obtain a typed handle implementing a core provider trait. Casting shares
+/// obtain a typed capability handle. Casting shares
 /// the store and guest state; it does not instantiate another component.
 ///
 /// Handles and pending launch operations retain the driver's call channel.
