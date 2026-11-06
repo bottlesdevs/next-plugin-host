@@ -9,8 +9,8 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
-next-paths.workspace = true
 async-trait.workspace = true
+next-paths.workspace = true
 futures = { version = "0.3", default-features = false, features = ["std"] }
 serde.workspace = true
 toml = "0.9.10"

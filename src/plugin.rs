@@ -51,10 +51,10 @@ pub(crate) struct Shared {
 /// Holds a loaded guest instance shared by its capability handles.
 ///
 /// [`crate::Plugins::load`] returns `Plugin<()>`. Use [`cast`](Plugin::cast) to
-/// obtain a typed capability handle. Casting shares
+/// obtain a typed handle exposing that capability's calls. Casting shares
 /// the store and guest state; it does not instantiate another component.
 ///
-/// Handles and pending launch operations retain the driver's call channel.
+/// Handles and pending calls retain the driver's call channel.
 /// The driver exits when it observes that all senders have been dropped.
 ///
 /// # Examples
@@ -72,8 +72,8 @@ pub struct Plugin<C = ()> {
 /// Links a capability to the exported interface it requires.
 ///
 /// [`crate::Account`] and [`crate::Library`] are the built-in markers. This
-/// mapping controls export discovery; provider implementations are supplied
-/// separately for their corresponding typed [`Plugin`] handles.
+/// mapping controls export discovery; capability calls are implemented
+/// separately on their corresponding typed [`Plugin`] handles.
 ///
 /// # Examples
 ///
@@ -118,7 +118,7 @@ impl Plugin {
     /// Returns [`None`] when the exact versioned name in [`Capability::INTERFACE`]
     /// is absent. This checks only that name, not function signatures. The
     /// adapter binds its world on each invocation, where incompatibilities are
-    /// returned as provider errors.
+    /// returned as call errors.
     ///
     /// Each successful cast retains the same guest instance and its state.
     ///
@@ -126,7 +126,7 @@ impl Plugin {
     ///
     /// ```text
     /// if let Some(library) = plugin.cast::<bottles_plugin_host::Library>() {
-    ///     bottles.library().register_provider(std::sync::Arc::new(library));
+    ///     let entries = library.list_entries().await?;
     /// }
     /// ```
     pub fn cast<C: Capability>(&self) -> Option<Plugin<C>> {

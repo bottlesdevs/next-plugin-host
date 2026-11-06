@@ -2,9 +2,9 @@
 #![warn(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-/// Adapts account exports and application-owned input interactions.
+/// Links accounts through account exports and caller-supplied input interactions.
 mod account;
-/// Adapts library exports and guest launch calls.
+/// Lists and launches entries through library exports.
 mod library;
 /// Reads the metadata stored beside a component.
 mod manifest;
@@ -21,19 +21,17 @@ pub use library::{Library, LibraryEntry};
 pub use manifest::Manifest;
 pub use plugin::{Capability, Plugin};
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use next_paths::plugins_dir;
+use std::{fs, path::Path};
 use wasmtime::{Cache, CacheConfig, Engine, component::Linker};
 
 use plugin::WasiState;
 
 /// Manages package files and the engine used to load their components.
 ///
-/// Packages live under [`next_paths::plugins_dir`] at `<id>/plugin.toml` and
-/// `<id>/plugin.wasm`.
-/// The catalog does not retain loaded handles or register application providers.
+/// Packages live under the application's plugins directory at
+/// `<id>/plugin.toml` and `<id>/plugin.wasm`.
+/// The catalog does not retain loaded handles.
 ///
 /// # Examples
 ///
@@ -44,7 +42,6 @@ use plugin::WasiState;
 /// }
 /// ```
 pub struct Plugins {
-    root: PathBuf,
     engine: Engine,
     linker: Linker<WasiState>,
 }
@@ -53,8 +50,8 @@ impl Plugins {
     /// Creates the shared engine, linker, and persistent compilation cache.
     ///
     /// Adds WASIp3, outbound HTTP, and account input imports. Packages are loaded
-    /// from [`next_paths::plugins_dir`]. Compiled components are cached across
-    /// launches in the `wasmtime` subdirectory of [`next_paths::cache_dir`].
+    /// from the application's plugins directory. Compiled components are cached
+    /// across launches in the `wasmtime` subdirectory of its cache directory.
     /// Package filesystem access starts with the package methods.
     ///
     /// # Errors
@@ -67,7 +64,6 @@ impl Plugins {
     /// let plugins = bottles_plugin_host::Plugins::new()?;
     /// ```
     pub fn new() -> wasmtime::Result<Self> {
-        fs::create_dir_all(next_paths::plugins_dir())?;
         let mut cache = CacheConfig::new();
         cache.with_directory(next_paths::cache_dir().join("wasmtime"));
         let mut config = wasmtime::Config::new();
@@ -78,11 +74,7 @@ impl Plugins {
         wasmtime_wasi::p3::add_to_linker(&mut linker)?;
         wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
         account::add_to_linker(&mut linker)?;
-        Ok(Self {
-            root: next_paths::plugins_dir().to_owned(),
-            engine,
-            linker,
-        })
+        Ok(Self { engine, linker })
     }
 
     /// Reads the manifests of installed packages.
@@ -105,7 +97,7 @@ impl Plugins {
     /// ```
     pub fn list(&self) -> wasmtime::Result<Vec<Manifest>> {
         let mut manifests = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
+        for entry in fs::read_dir(plugins_dir())? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 let manifest = Manifest::read(&entry.path().join("plugin.toml"))?;
@@ -135,7 +127,7 @@ impl Plugins {
     /// ```
     pub fn install(&self, source: &Path) -> wasmtime::Result<Manifest> {
         let manifest = Manifest::read(&source.join("plugin.toml"))?;
-        let directory = self.root.join(&manifest.id);
+        let directory = plugins_dir().join(&manifest.id);
         fs::create_dir_all(&directory)?;
         fs::copy(source.join("plugin.toml"), directory.join("plugin.toml"))?;
         fs::copy(source.join("plugin.wasm"), directory.join("plugin.wasm"))?;
@@ -145,7 +137,7 @@ impl Plugins {
     /// Removes an installed package.
     ///
     /// Recursively removes the path formed by joining `id` to the catalog
-    /// root. Loaded instances are unaffected.
+    /// root. Loaded instances and core registrations are unaffected.
     ///
     /// # Errors
     ///
@@ -158,14 +150,14 @@ impl Plugins {
     /// plugins.uninstall("example")?;
     /// ```
     pub fn uninstall(&self, id: &str) -> wasmtime::Result<()> {
-        Ok(fs::remove_dir_all(self.root.join(id))?)
+        Ok(fs::remove_dir_all(plugins_dir().join(id))?)
     }
 
     /// Loads one package into a long-lived driver thread.
     ///
     /// Reads the manifest, compiles the component, and instantiates it before
     /// returning. Every load creates a new guest instance; casts of the returned
-    /// handle share that instance. Loading does not register providers.
+    /// handle share that instance.
     ///
     /// # Errors
     ///
@@ -179,11 +171,11 @@ impl Plugins {
     /// ```text
     /// let plugin = plugins.load("example").await?;
     /// if let Some(library) = plugin.cast::<bottles_plugin_host::Library>() {
-    ///     bottles.library().register_provider(std::sync::Arc::new(library));
+    ///     let entries = library.list_entries().await?;
     /// }
     /// ```
     pub async fn load(&self, id: &str) -> wasmtime::Result<Plugin> {
-        let directory = self.root.join(id);
+        let directory = plugins_dir().join(id);
         let manifest = Manifest::read(&directory.join("plugin.toml"))?;
         Plugin::load(
             manifest,

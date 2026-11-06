@@ -8,37 +8,40 @@ use crate::{
     plugin::{Plugin, WasiState, call},
 };
 
-/// Input supplied by the application to an account-link invocation.
+/// Supplies user input requested by a plugin during account linking.
 #[async_trait]
 pub trait Interaction: Send + Sync {
-    /// Opens the provider URL and returns the requested input.
+    /// Shows `url` with `instructions` and returns the user's input.
     async fn request_input(&self, url: url::Url, instructions: String) -> Result<String, String>;
 }
 
-/// Public identity returned by an account plugin.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AccountIdentity {
-    /// Provider-local account identifier.
-    pub account_id: String,
-    /// Human-readable account name.
-    pub display_name: String,
-}
-
-/// Account identity and optional opaque credential returned by the guest.
-pub struct LinkedAccount {
-    /// Public account identity.
-    pub identity: AccountIdentity,
-    /// Private credential; persistence belongs to the application.
-    pub credential: Option<Vec<u8>>,
-}
-
-/// Marker for plugins exporting the account-provider interface.
+/// Marker for plugins that export the account-provider interface.
+///
+/// [`Plugin<Account>`] links an account by forwarding the guest's input requests
+/// to the caller's [`Interaction`] and returns the guest's identity and optional
+/// credential unchanged.
+///
+/// The interaction remains in the driver's resource table until the queued
+/// invocation finishes, even if its caller stops awaiting it. The resource is
+/// removed after the guest returns, including when the call returns an error;
+/// shutting down the driver drops its table and any remaining interactions.
+/// Binding, driver, and guest failures are returned as error strings.
+///
+/// # Examples
+///
+/// ```text
+/// if let Some(account) = plugin.cast::<bottles_plugin_host::Account>() {
+///     let linked = account.link_account(interaction).await?;
+///     println!("{}", linked.identity.display_name);
+/// }
+/// ```
 pub struct Account;
 
 impl Capability for Account {
     const INTERFACE: PluginInterface = PluginInterface::AccountProvider;
 }
 
+#[allow(missing_docs)]
 mod bindings {
     pub type Interaction = std::sync::Arc<dyn super::Interaction>;
 
@@ -83,12 +86,22 @@ impl account_link::HostInteraction for WasiState {
 
 impl account_link::Host for WasiState {}
 
+/// Public identity reported by an account plugin.
+pub use bindings::exports::bottles::plugin::account_provider::AccountIdentity;
+/// An account identity and the optional private credential returned by linking.
+pub use bindings::exports::bottles::plugin::account_provider::LinkedAccount;
+
 impl Plugin<Account> {
-    /// Runs the guest account-link flow with the supplied input handler.
+    /// Runs the guest's account-link flow using `interaction` for user input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver is closed, the bindings cannot be
+    /// constructed, or the guest reports a failure.
     pub async fn link_account(
         &self,
         interaction: Arc<dyn Interaction>,
-    ) -> Result<LinkedAccount, String> {
+    ) -> wasmtime::Result<LinkedAccount> {
         call(&self.shared.calls, move |accessor, instance| {
             Box::pin(async move {
                 let bindings =
@@ -104,14 +117,7 @@ impl Plugin<Account> {
                 result
             })
         })
-        .await
-        .map_err(|error| error.to_string())?
-        .map(|linked| LinkedAccount {
-            identity: AccountIdentity {
-                account_id: linked.identity.account_id,
-                display_name: linked.identity.display_name,
-            },
-            credential: linked.credential,
-        })
+        .await?
+        .map_err(wasmtime::Error::msg)
     }
 }

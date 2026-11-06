@@ -1,21 +1,29 @@
 use crate::{Capability, Plugin, PluginInterface, plugin::call};
 
-/// Launchable entry returned by a library plugin.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LibraryEntry {
-    /// Identifier understood by the guest's launch method.
-    pub id: String,
-    /// Human-readable title.
-    pub title: String,
-}
-
-/// Marker for plugins exporting the library-provider interface.
+/// Marker for plugins that export the library-provider interface.
+///
+/// [`Plugin<Library>`] lists the guest's current entries and forwards launch
+/// requests. Each call is queued to the plugin's driver; dropping the returned
+/// future stops waiting but does not withdraw an already queued guest call.
+/// Binding, driver, and guest failures are returned as errors.
+///
+/// # Examples
+///
+/// ```text
+/// if let Some(library) = plugin.cast::<bottles_plugin_host::Library>() {
+///     for entry in library.list_entries().await? {
+///         println!("{}: {}", entry.id, entry.title);
+///     }
+///     library.launch("entry-id").await?;
+/// }
+/// ```
 pub struct Library;
 
 impl Capability for Library {
     const INTERFACE: PluginInterface = PluginInterface::LibraryProvider;
 }
 
+#[allow(missing_docs)]
 mod bindings {
     wasmtime::component::bindgen!({
         path: "../next-plugin-api/wit",
@@ -24,9 +32,20 @@ mod bindings {
     });
 }
 
+/// One installed title reported by a library plugin.
+///
+/// `id` is local to the plugin and is passed back unchanged to
+/// [`Plugin::<Library>::launch`].
+pub use bindings::exports::bottles::plugin::library_provider::LibraryEntry;
+
 impl Plugin<Library> {
-    /// Queries the guest's current library.
-    pub async fn list_entries(&self) -> Result<Vec<LibraryEntry>, String> {
+    /// Asks the guest for its current installed, launchable titles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver is closed, the bindings cannot be
+    /// constructed, or the guest reports a failure.
+    pub async fn list_entries(&self) -> wasmtime::Result<Vec<LibraryEntry>> {
         call(&self.shared.calls, |accessor, instance| {
             Box::pin(async move {
                 let bindings =
@@ -37,22 +56,19 @@ impl Plugin<Library> {
                     .await
             })
         })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result)
-        .map(|entries| {
-            entries
-                .into_iter()
-                .map(|entry| LibraryEntry {
-                    id: entry.id,
-                    title: entry.title,
-                })
-                .collect()
-        })
+        .await?
+        .map_err(wasmtime::Error::msg)
     }
 
-    /// Queues a guest launch when this future is polled.
-    pub async fn launch(&self, entry_id: &str) -> Result<(), String> {
+    /// Asks the guest to launch an entry returned by [`Self::list_entries`].
+    ///
+    /// Completion means the launch request finished, not that the title exited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver is closed, the bindings cannot be
+    /// constructed, or the guest reports a failure.
+    pub async fn launch(&self, entry_id: &str) -> wasmtime::Result<()> {
         let entry_id = entry_id.to_owned();
         call(&self.shared.calls, move |accessor, instance| {
             Box::pin(async move {
@@ -64,7 +80,7 @@ impl Plugin<Library> {
                     .await
             })
         })
-        .await
-        .map_err(|error| error.to_string())?
+        .await?
+        .map_err(wasmtime::Error::msg)
     }
 }
