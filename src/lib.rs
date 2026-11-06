@@ -50,7 +50,7 @@ impl Plugins {
     /// Creates the shared engine, linker, and persistent compilation cache.
     ///
     /// Adds WASIp3, outbound HTTP, and account input imports. Packages are loaded
-    /// from the application's plugins directory. Compiled components are cached
+    /// from the application's plugins directory, which is created if missing. Compiled components are cached
     /// across launches in the `wasmtime` subdirectory of its cache directory.
     /// Package filesystem access starts with the package methods.
     ///
@@ -64,6 +64,7 @@ impl Plugins {
     /// let plugins = bottles_plugin_host::Plugins::new()?;
     /// ```
     pub fn new() -> wasmtime::Result<Self> {
+        fs::create_dir_all(plugins_dir())?;
         let mut cache = CacheConfig::new();
         cache.with_directory(next_paths::cache_dir().join("wasmtime"));
         let mut config = wasmtime::Config::new();
@@ -86,7 +87,7 @@ impl Plugins {
     ///
     /// Returns an error if the catalog cannot be read, an entry's type cannot
     /// be determined, or any directory's manifest cannot be read or parsed.
-    /// A missing catalog directory is an error.
+    /// A catalog directory removed after [`Plugins::new`] is an error.
     ///
     /// # Examples
     ///

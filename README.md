@@ -54,8 +54,7 @@ version = "0.1.0"
 `plugin.wasm` is a component built with the guest SDK, `bottles-plugin-api`.
 [`Plugins::install`] copies these two files from a source directory and overwrites
 existing files. [`Plugins::list`] reads each directory's manifest in filesystem
-order. [`Plugins::new`] does not create the catalog directory; listing requires it
-to exist. Package IDs are joined directly to the catalog path.
+order. [`Plugins::new`] creates the catalog directory if it is missing. Package IDs are joined directly to the catalog path.
 
 Installation and removal affect files. Loaded instances keep their state until their handles are released. Each [`Plugins::load`] call
 creates a separate instance. Wasmtime's disk cache reuses compiled components
