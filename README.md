@@ -6,21 +6,23 @@ instances, and call the capabilities they want to offer.
 
 ## Load and call capabilities
 
-[`Plugins`] manages files in a catalog. Loading a package returns an untyped
-[`Plugin`] handle. Use [`Plugin::cast`] to obtain a [`Plugin<Account>`] or
-[`Plugin<Library>`], then keep the handles wherever the application needs them.
+[`Plugins`] owns the installed packages and one loaded instance of each.
+[`Plugins::load_installed`] loads every installed plugin, and
+[`Plugins::providing`] returns a typed handle, such as [`Plugin<Library>`], for
+every loaded plugin that provides that capability. [`Plugins::get`] returns one
+loaded plugin, which [`Plugin::cast`] turns into a typed handle.
 
 ```text
 use bottles_plugin_host::{Library, Plugins};
 
 async fn list_plugin_entries() -> wasmtime::Result<()> {
     let plugins = Plugins::new()?;
-    for manifest in plugins.list()? {
-        let plugin = plugins.load(&manifest.id).await?;
-        if let Some(library) = plugin.cast::<Library>() {
-            for entry in library.list_entries().await? {
-                println!("{}: {}", manifest.id, entry.title);
-            }
+    for (id, error) in plugins.load_installed().await? {
+        eprintln!("{id} failed to load: {error}");
+    }
+    for library in plugins.providing::<Library>() {
+        for entry in library.list_entries().await? {
+            println!("{}: {}", library.manifest().id, entry.title);
         }
     }
     Ok(())
@@ -52,12 +54,14 @@ version = "0.1.0"
 ```
 
 `plugin.wasm` is a component built with the guest SDK, `bottles-plugin-api`.
-[`Plugins::install`] copies these two files from a source directory and overwrites
-existing files. [`Plugins::list`] reads each directory's manifest in filesystem
+[`Plugins::install`] copies these two files from a source directory, overwriting
+existing files, and loads the plugin. [`Plugins::uninstall`] unloads it and
+removes its directory. [`Plugins::list`] reads each directory's manifest in filesystem
 order. [`Plugins::new`] creates the catalog directory if it is missing. Package IDs are joined directly to the catalog path.
 
-Installation and removal affect files. Loaded instances keep their state until their handles are released. Each [`Plugins::load`] call
-creates a separate instance. Wasmtime's disk cache reuses compiled components
+Each installed plugin has at most one loaded instance, owned by [`Plugins`]; handles
+to an instance that was replaced or unloaded keep it alive until they are dropped.
+Wasmtime's disk cache reuses compiled components
 across loads and launches, with invalidation handled by Wasmtime. The CLI and UI
 share the `wasmtime` directory under Bottles' cache directory. Guest instance
 state is not cached.
@@ -72,7 +76,7 @@ can occupy its driver thread without yielding.
 
 The driver stays alive while a call sender exists. Typed handles retain the shared
 sender. When the driver observes the closed channel, it exits and drops in-flight
-calls. Dropping the catalog does not stop already loaded instances.
+calls. Dropping [`Plugins`] stops an instance once no other handle to it remains.
 
 Dropping the caller's future does not withdraw a call already queued to the
 driver, so the guest may still complete a launch. Account interactions remain with
