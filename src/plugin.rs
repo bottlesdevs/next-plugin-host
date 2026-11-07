@@ -50,9 +50,10 @@ pub(crate) struct Shared {
 
 /// Holds a loaded guest instance shared by its capability handles.
 ///
-/// [`crate::Plugins::load`] returns `Plugin<()>`. Use [`cast`](Plugin::cast) to
-/// obtain a typed handle exposing that capability's calls. Casting shares
-/// the store and guest state; it does not instantiate another component.
+/// [`crate::Plugins::get`] returns `Plugin<()>`, and
+/// [`crate::Plugins::providing`] returns typed handles. Use [`cast`](Plugin::cast)
+/// to obtain a typed handle exposing a capability's calls. Clones and casts share
+/// the store and guest state; they do not instantiate another component.
 ///
 /// Handles and pending calls retain the driver's call channel.
 /// The driver exits when it observes that all senders have been dropped.
@@ -60,13 +61,22 @@ pub(crate) struct Shared {
 /// # Examples
 ///
 /// ```text
-/// let plugin = plugins.load("example").await?;
+/// let plugin = plugins.get("example").expect("loaded");
 /// let account = plugin.cast::<bottles_plugin_host::Account>();
 /// let library = plugin.cast::<bottles_plugin_host::Library>();
 /// ```
 pub struct Plugin<C = ()> {
     pub(crate) shared: Arc<Shared>,
     capability: PhantomData<fn() -> C>,
+}
+
+impl<C> Clone for Plugin<C> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            capability: PhantomData,
+        }
+    }
 }
 
 /// Links a capability to the exported interface it requires.
