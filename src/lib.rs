@@ -16,7 +16,6 @@ mod interfaces {
 }
 
 pub use account::{Account, AccountIdentity, Interaction, LinkedAccount};
-pub use interfaces::PluginInterface;
 pub use library::{Library, LibraryEntry};
 pub use manifest::Manifest;
 pub use plugin::{Capability, Plugin};

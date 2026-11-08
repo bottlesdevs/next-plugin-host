@@ -1,4 +1,4 @@
-use crate::{Capability, Plugin, PluginInterface, plugin::call};
+use crate::{Capability, Plugin, interfaces, plugin::call};
 
 /// Marker for plugins that export the library-provider interface.
 ///
@@ -20,7 +20,7 @@ use crate::{Capability, Plugin, PluginInterface, plugin::call};
 pub struct Library;
 
 impl Capability for Library {
-    const INTERFACE: PluginInterface = PluginInterface::LibraryProvider;
+    const INTERFACE: &'static str = interfaces::LIBRARY_PROVIDER;
 }
 
 #[allow(missing_docs)]
