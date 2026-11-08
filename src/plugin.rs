@@ -12,7 +12,7 @@ use wasmtime::{
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
-use crate::{Manifest, PluginInterface};
+use crate::Manifest;
 
 pub(crate) struct WasiState {
     pub(crate) table: ResourceTable,
@@ -88,14 +88,13 @@ impl<C> Clone for Plugin<C> {
 /// # Examples
 ///
 /// ```text
-/// use bottles_plugin_host::{Capability, Library, PluginInterface};
+/// use bottles_plugin_host::{Capability, Library};
 ///
-/// let interface = <Library as Capability>::INTERFACE;
-/// let name = interface.as_str(); // "bottles:plugin/library-provider@0.1.0"
+/// let name = <Library as Capability>::INTERFACE; // "bottles:plugin/library-provider@0.1.0"
 /// ```
 pub trait Capability {
     /// Names the versioned WIT interface required for a cast.
-    const INTERFACE: PluginInterface;
+    const INTERFACE: &'static str;
 }
 
 impl<C> Plugin<C> {
@@ -116,10 +115,10 @@ impl<C> Plugin<C> {
 
 impl Plugin {
     /// Reports whether this component exports the named interface.
-    fn exports(&self, interface: PluginInterface) -> bool {
+    fn exports(&self, interface: &str) -> bool {
         self.shared
             .component
-            .get_export_index(None, interface.as_str())
+            .get_export_index(None, interface)
             .is_some()
     }
 

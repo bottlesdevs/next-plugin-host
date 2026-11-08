@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use wasmtime::component::{Accessor, HasSelf, Linker, Resource};
 
 use crate::{
-    Capability, PluginInterface,
+    Capability, interfaces,
     plugin::{Plugin, WasiState, call},
 };
 
@@ -38,7 +38,7 @@ pub trait Interaction: Send + Sync {
 pub struct Account;
 
 impl Capability for Account {
-    const INTERFACE: PluginInterface = PluginInterface::AccountProvider;
+    const INTERFACE: &'static str = interfaces::ACCOUNT_PROVIDER;
 }
 
 #[allow(missing_docs)]
