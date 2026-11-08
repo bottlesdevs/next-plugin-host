@@ -7,7 +7,7 @@ instances, and call the capabilities they want to offer.
 ## Load and call capabilities
 
 [`Plugins`] owns the installed packages and one loaded instance of each.
-[`Plugins::load_installed`] loads every installed plugin, and
+[`Plugins::reload`] brings the loaded plugins in line with the installed ones, and
 [`Plugins::providing`] returns a typed handle, such as [`Plugin<Library>`], for
 every loaded plugin that provides that capability. [`Plugins::get`] returns one
 loaded plugin, which [`Plugin::cast`] turns into a typed handle.
@@ -17,7 +17,7 @@ use bottles_plugin_host::{Library, Plugins};
 
 async fn list_plugin_entries() -> wasmtime::Result<()> {
     let plugins = Plugins::new()?;
-    for (id, error) in plugins.load_installed().await? {
+    for (id, error) in plugins.reload().await? {
         eprintln!("{id} failed to load: {error}");
     }
     for library in plugins.providing::<Library>() {
@@ -55,8 +55,8 @@ version = "0.1.0"
 
 `plugin.wasm` is a component built with the guest SDK, `bottles-plugin-api`.
 [`Plugins::install`] copies these two files from a source directory, overwriting
-existing files, and loads the plugin. [`Plugins::uninstall`] unloads it and
-removes its directory. [`Plugins::list`] reads each directory's manifest in filesystem
+existing files, and [`Plugins::uninstall`] removes the directory. Both forget the
+loaded instance, and the next [`Plugins::reload`] applies the change. [`Plugins::list`] reads each directory's manifest in filesystem
 order. [`Plugins::new`] creates the catalog directory if it is missing. Package IDs are joined directly to the catalog path.
 
 Each installed plugin has at most one loaded instance, owned by [`Plugins`]; handles
