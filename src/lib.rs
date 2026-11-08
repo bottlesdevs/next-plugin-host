@@ -21,7 +21,12 @@ pub use manifest::Manifest;
 pub use plugin::{Capability, Plugin};
 
 use next_paths::plugins_dir;
-use std::{collections::HashMap, fs, path::Path, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+    sync::Mutex,
+};
 use wasmtime::{Cache, CacheConfig, Engine, component::Linker};
 
 use plugin::WasiState;
@@ -36,7 +41,7 @@ use plugin::WasiState;
 ///
 /// ```text
 /// let plugins = bottles_plugin_host::Plugins::new()?;
-/// for (id, error) in plugins.load_installed().await? {
+/// for (id, error) in plugins.reload().await? {
 ///     eprintln!("{id} failed to load: {error}");
 /// }
 /// for library in plugins.providing::<bottles_plugin_host::Library>() {
@@ -57,7 +62,7 @@ impl Plugins {
     /// from the application's plugins directory, which is created if missing.
     /// Compiled components are cached across launches in the `wasmtime`
     /// subdirectory of the application's cache directory. No plugin is loaded
-    /// until [`Plugins::load_installed`] or [`Plugins::install`].
+    /// until [`Plugins::reload`].
     ///
     /// # Errors
     ///
@@ -102,22 +107,38 @@ impl Plugins {
         Ok(manifests)
     }
 
-    /// Loads every installed plugin that is not loaded yet.
+    /// Brings the loaded plugins in line with the installed packages.
+    ///
+    /// Loads every installed plugin that is not loaded and drops every loaded
+    /// plugin that is no longer installed. This is the one path by which plugins
+    /// are loaded: call it at startup and after [`Plugins::install`] or
+    /// [`Plugins::uninstall`].
     ///
     /// A plugin that fails to load is left out, and its error is returned with
-    /// its ID so the caller decides how to report it; the other plugins still load.
+    /// its ID so the caller decides how to report it; the other plugins still
+    /// load, and the next reload tries it again.
     ///
     /// # Errors
     ///
-    /// Returns an error if the installed packages cannot be listed.
-    pub async fn load_installed(&self) -> wasmtime::Result<Vec<(String, wasmtime::Error)>> {
-        let mut failed = Vec::new();
-        for manifest in self.list()? {
-            if self.get(&manifest.id).is_some() {
-                continue;
+    /// Returns an error if the plugins directory cannot be read.
+    pub async fn reload(&self) -> wasmtime::Result<Vec<(String, wasmtime::Error)>> {
+        let mut installed = HashSet::new();
+        for entry in fs::read_dir(plugins_dir())? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                installed.insert(entry.file_name().to_string_lossy().into_owned());
             }
-            if let Err(error) = self.load(&manifest.id).await {
-                failed.push((manifest.id, error));
+        }
+        self.loaded
+            .lock()
+            .unwrap()
+            .retain(|id, _| installed.contains(id));
+        let mut failed = Vec::new();
+        for id in installed {
+            if self.get(&id).is_none()
+                && let Err(error) = self.load(&id).await
+            {
+                failed.push((id, error));
             }
         }
         Ok(failed)
@@ -146,30 +167,31 @@ impl Plugins {
             .collect()
     }
 
-    /// Installs a package from `source`, then loads it.
+    /// Copies a package from `source` into the plugins directory.
     ///
     /// Uses the source manifest's ID as the destination path, overwriting
     /// `plugin.toml` and `plugin.wasm`. A plugin already loaded under that ID is
-    /// replaced; handles to the old instance keep it alive until they are dropped.
+    /// forgotten; handles to the old instance keep it alive until they are
+    /// dropped. Call [`Plugins::reload`] to load the new version.
     ///
     /// # Errors
     ///
-    /// Returns an error if the source manifest cannot be read or parsed, either
-    /// file cannot be copied, or the installed plugin cannot be loaded. Files
-    /// already copied are left in place if a later step fails.
-    pub async fn install(&self, source: &Path) -> wasmtime::Result<Manifest> {
+    /// Returns an error if the source manifest cannot be read or parsed, or
+    /// either file cannot be copied. Files already copied are left in place if
+    /// a later copy fails.
+    pub fn install(&self, source: &Path) -> wasmtime::Result<Manifest> {
         let manifest = Manifest::read(&source.join("plugin.toml"))?;
         let directory = plugins_dir().join(&manifest.id);
         fs::create_dir_all(&directory)?;
         fs::copy(source.join("plugin.toml"), directory.join("plugin.toml"))?;
         fs::copy(source.join("plugin.wasm"), directory.join("plugin.wasm"))?;
-        self.load(&manifest.id).await?;
+        self.loaded.lock().unwrap().remove(&manifest.id);
         Ok(manifest)
     }
 
-    /// Unloads plugin `id` and removes its package.
+    /// Forgets plugin `id` and removes its package.
     ///
-    /// Handles to the unloaded instance keep it alive until they are dropped.
+    /// Handles to its instance keep it alive until they are dropped.
     ///
     /// # Errors
     ///
@@ -180,8 +202,7 @@ impl Plugins {
         Ok(fs::remove_dir_all(plugins_dir().join(id))?)
     }
 
-    /// Loads installed plugin `id` on its own driver thread, replacing any
-    /// instance already loaded under that ID.
+    /// Loads installed plugin `id` on its own driver thread.
     async fn load(&self, id: &str) -> wasmtime::Result<Plugin> {
         let directory = plugins_dir().join(id);
         let manifest = Manifest::read(&directory.join("plugin.toml"))?;
