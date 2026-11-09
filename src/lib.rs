@@ -50,7 +50,6 @@ use plugin::WasiState;
 /// }
 /// ```
 pub struct Plugins {
-    engine: Engine,
     linker: Linker<WasiState>,
     /// Loaded plugins, by ID.
     loaded: Mutex<HashMap<String, Plugin>>,
@@ -81,7 +80,6 @@ impl Plugins {
         wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
         account::add_to_linker(&mut linker)?;
         Ok(Self {
-            engine,
             linker,
             loaded: Mutex::new(HashMap::new()),
         })
@@ -101,7 +99,7 @@ impl Plugins {
         for entry in fs::read_dir(installed_dir())? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
-                let manifest = Manifest::read(&entry.path().join("plugin.toml"))?;
+                let manifest = Manifest::read(&entry.path())?;
                 manifests.push(manifest);
             }
         }
@@ -181,11 +179,11 @@ impl Plugins {
     /// either file cannot be copied. Files already copied are left in place if
     /// a later copy fails.
     pub fn install(&self, source: &Path) -> wasmtime::Result<Manifest> {
-        let manifest = Manifest::read(&source.join("plugin.toml"))?;
-        let directory = installed_dir().join(&manifest.id);
+        let manifest = Manifest::read(source)?;
+        let directory = package_dir(&manifest.id);
         fs::create_dir_all(&directory)?;
-        fs::copy(source.join("plugin.toml"), directory.join("plugin.toml"))?;
-        fs::copy(source.join("plugin.wasm"), directory.join("plugin.wasm"))?;
+        fs::copy(manifest_path(source), manifest_path(&directory))?;
+        fs::copy(component_path(source), component_path(&directory))?;
         self.loaded.lock().unwrap().remove(&manifest.id);
         Ok(manifest)
     }
@@ -200,7 +198,7 @@ impl Plugins {
     /// removed, including when it does not exist.
     pub fn uninstall(&self, id: &str) -> wasmtime::Result<()> {
         self.loaded.lock().unwrap().remove(id);
-        fs::remove_dir_all(installed_dir().join(id))?;
+        fs::remove_dir_all(package_dir(id))?;
         if data_dir(id).exists() {
             fs::remove_dir_all(data_dir(id))?;
         }
@@ -209,17 +207,8 @@ impl Plugins {
 
     /// Loads installed plugin `id` on its own driver thread.
     async fn load(&self, id: &str) -> wasmtime::Result<Plugin> {
-        let directory = installed_dir().join(id);
-        let manifest = Manifest::read(&directory.join("plugin.toml"))?;
-        fs::create_dir_all(data_dir(id))?;
-        let plugin = Plugin::load(
-            manifest,
-            directory.join("plugin.wasm"),
-            data_dir(id),
-            self.engine.clone(),
-            self.linker.clone(),
-        )
-        .await?;
+        let manifest = Manifest::read(&package_dir(id))?;
+        let plugin = Plugin::load(manifest, self.linker.clone()).await?;
         self.loaded
             .lock()
             .unwrap()
@@ -231,6 +220,21 @@ impl Plugins {
 /// The directory holding one package directory per installed plugin.
 fn installed_dir() -> PathBuf {
     plugins_dir().join("installed")
+}
+
+/// The package directory of plugin `id`.
+fn package_dir(id: &str) -> PathBuf {
+    installed_dir().join(id)
+}
+
+/// The manifest file of the package in `package`.
+fn manifest_path(package: &Path) -> PathBuf {
+    package.join("plugin.toml")
+}
+
+/// The component file of the package in `package`.
+fn component_path(package: &Path) -> PathBuf {
+    package.join("plugin.wasm")
 }
 
 /// The private read-write directory of plugin `id`.

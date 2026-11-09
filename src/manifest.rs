@@ -28,8 +28,10 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub(crate) fn read(path: &Path) -> wasmtime::Result<Self> {
-        let source = fs::read_to_string(path)
+    /// Reads the manifest of the package in `package`.
+    pub(crate) fn read(package: &Path) -> wasmtime::Result<Self> {
+        let path = crate::manifest_path(package);
+        let source = fs::read_to_string(&path)
             .with_context(|| format!("failed to read plugin manifest {}", path.display()))?;
 
         toml::from_str(&source)
