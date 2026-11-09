@@ -9,7 +9,7 @@ use wasmtime::{
     Engine, Store,
     component::{Accessor, Component, Instance, Linker, ResourceTable},
 };
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::Manifest;
@@ -148,6 +148,7 @@ impl Plugin {
     pub(crate) async fn load(
         manifest: Manifest,
         path: PathBuf,
+        data: PathBuf,
         engine: Engine,
         linker: Linker<WasiState>,
     ) -> wasmtime::Result<Self> {
@@ -161,7 +162,7 @@ impl Plugin {
                     .build()
                 {
                     Ok(runtime) => {
-                        runtime.block_on(drive(engine, linker, path, ready_send, incoming))
+                        runtime.block_on(drive(engine, linker, path, data, ready_send, incoming))
                     }
                     Err(error) => {
                         let _ = ready_send.send(Err(error.into()));
@@ -186,17 +187,21 @@ async fn drive(
     engine: Engine,
     linker: Linker<WasiState>,
     path: PathBuf,
+    data: PathBuf,
     ready_send: oneshot::Sender<wasmtime::Result<Component>>,
     mut incoming: mpsc::UnboundedReceiver<Call>,
 ) {
     let result = async {
         let component = Component::from_file(&engine, path)?;
         let pre = linker.instantiate_pre(&component)?;
+        let mut wasi = WasiCtxBuilder::new();
+        wasi.inherit_stderr()
+            .preopened_dir(data, ".", FsPerms::ReadWrite)?;
         let mut store = Store::new(
             &engine,
             WasiState {
                 table: ResourceTable::new(),
-                wasi: WasiCtxBuilder::new().inherit_stderr().build(),
+                wasi: wasi.build(),
                 http: WasiHttpCtx::new(),
             },
         );

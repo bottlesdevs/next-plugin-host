@@ -36,13 +36,16 @@ missing or incompatible functions fail at that point.
 
 ## Package layout
 
-The catalog contains one directory per package:
+The plugins directory holds one directory per package and one per plugin's private data:
 
 ```text
 plugins/
-  example/
-    plugin.toml
-    plugin.wasm
+  installed/
+    example/
+      plugin.toml
+      plugin.wasm
+  data/
+    example/
 ```
 
 `plugin.toml` describes [`Manifest`]:
@@ -83,6 +86,7 @@ driver, so the guest may still complete a launch. Account interactions remain wi
 their queued invocation until it completes or the driver drops it. The host does
 not recreate the instance after a trap.
 
-Guests inherit standard error and can make outbound HTTP requests. No filesystem
-directories are preopened. Account input requests are forwarded to the caller's
-[`Interaction`]; the host does not store returned credentials.
+Guests inherit standard error and can make outbound HTTP requests. A plugin's
+`data/<id>` directory is preopened read-write as `.`, is the only directory it can
+see, survives updates, and is removed by [`Plugins::uninstall`]. Account input requests are forwarded to the caller's
+[`Interaction`].

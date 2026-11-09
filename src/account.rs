@@ -18,8 +18,7 @@ pub trait Interaction: Send + Sync {
 /// Marker for plugins that export the account-provider interface.
 ///
 /// [`Plugin<Account>`] links an account by forwarding the guest's input requests
-/// to the caller's [`Interaction`] and returns the guest's identity and optional
-/// credential unchanged.
+/// to the caller's [`Interaction`] and returns the guest's identity unchanged.
 ///
 /// The interaction remains in the driver's resource table until the queued
 /// invocation finishes, even if its caller stops awaiting it. The resource is
@@ -31,8 +30,8 @@ pub trait Interaction: Send + Sync {
 ///
 /// ```text
 /// if let Some(account) = plugin.cast::<bottles_plugin_host::Account>() {
-///     let linked = account.link_account(interaction).await?;
-///     println!("{}", linked.identity.display_name);
+///     let identity = account.link_account(interaction).await?;
+///     println!("{}", identity.display_name);
 /// }
 /// ```
 pub struct Account;
@@ -88,8 +87,6 @@ impl account_link::Host for WasiState {}
 
 /// Public identity reported by an account plugin.
 pub use bindings::exports::bottles::plugin::account_provider::AccountIdentity;
-/// An account identity and the optional private credential returned by linking.
-pub use bindings::exports::bottles::plugin::account_provider::LinkedAccount;
 
 impl Plugin<Account> {
     /// Runs the guest's account-link flow using `interaction` for user input.
@@ -101,7 +98,7 @@ impl Plugin<Account> {
     pub async fn link_account(
         &self,
         interaction: Arc<dyn Interaction>,
-    ) -> wasmtime::Result<LinkedAccount> {
+    ) -> wasmtime::Result<AccountIdentity> {
         call(&self.shared.calls, move |accessor, instance| {
             Box::pin(async move {
                 let bindings =
