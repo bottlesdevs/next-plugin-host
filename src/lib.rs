@@ -15,7 +15,7 @@ mod interfaces {
     include!(concat!(env!("OUT_DIR"), "/plugin_interfaces.rs"));
 }
 
-pub use account::{Account, AccountIdentity, Interaction, LinkedAccount};
+pub use account::{Account, AccountIdentity, Interaction};
 pub use library::{Library, LibraryEntry};
 pub use manifest::Manifest;
 pub use plugin::{Capability, Plugin};
@@ -24,7 +24,7 @@ use next_paths::plugins_dir;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Mutex,
 };
 use wasmtime::{Cache, CacheConfig, Engine, component::Linker};
@@ -34,7 +34,8 @@ use plugin::WasiState;
 /// Owns the installed plugin packages and one loaded instance of each.
 ///
 /// Packages live under the application's plugins directory at
-/// `<id>/plugin.toml` and `<id>/plugin.wasm`. Each installed plugin has at most
+/// `installed/<id>/plugin.toml` and `installed/<id>/plugin.wasm`, and each
+/// plugin's private data at `data/<id>/`. Each installed plugin has at most
 /// one loaded instance, shared by every handle and capability cast from it.
 ///
 /// # Examples
@@ -68,7 +69,7 @@ impl Plugins {
     ///
     /// Returns an error if the cache, engine, or host imports cannot be configured.
     pub fn new() -> wasmtime::Result<Self> {
-        fs::create_dir_all(plugins_dir())?;
+        fs::create_dir_all(installed_dir())?;
         let mut cache = CacheConfig::new();
         cache.with_directory(next_paths::cache_dir().join("wasmtime"));
         let mut config = wasmtime::Config::new();
@@ -97,7 +98,7 @@ impl Plugins {
     /// cannot be determined, or any directory's manifest cannot be read or parsed.
     pub fn list(&self) -> wasmtime::Result<Vec<Manifest>> {
         let mut manifests = Vec::new();
-        for entry in fs::read_dir(plugins_dir())? {
+        for entry in fs::read_dir(installed_dir())? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 let manifest = Manifest::read(&entry.path().join("plugin.toml"))?;
@@ -123,7 +124,7 @@ impl Plugins {
     /// Returns an error if the plugins directory cannot be read.
     pub async fn reload(&self) -> wasmtime::Result<Vec<(String, wasmtime::Error)>> {
         let mut installed = HashSet::new();
-        for entry in fs::read_dir(plugins_dir())? {
+        for entry in fs::read_dir(installed_dir())? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 installed.insert(entry.file_name().to_string_lossy().into_owned());
@@ -181,7 +182,7 @@ impl Plugins {
     /// a later copy fails.
     pub fn install(&self, source: &Path) -> wasmtime::Result<Manifest> {
         let manifest = Manifest::read(&source.join("plugin.toml"))?;
-        let directory = plugins_dir().join(&manifest.id);
+        let directory = installed_dir().join(&manifest.id);
         fs::create_dir_all(&directory)?;
         fs::copy(source.join("plugin.toml"), directory.join("plugin.toml"))?;
         fs::copy(source.join("plugin.wasm"), directory.join("plugin.wasm"))?;
@@ -189,7 +190,7 @@ impl Plugins {
         Ok(manifest)
     }
 
-    /// Forgets plugin `id` and removes its package.
+    /// Forgets plugin `id` and removes its package and private data.
     ///
     /// Handles to its instance keep it alive until they are dropped.
     ///
@@ -199,16 +200,22 @@ impl Plugins {
     /// removed, including when it does not exist.
     pub fn uninstall(&self, id: &str) -> wasmtime::Result<()> {
         self.loaded.lock().unwrap().remove(id);
-        Ok(fs::remove_dir_all(plugins_dir().join(id))?)
+        fs::remove_dir_all(installed_dir().join(id))?;
+        if data_dir(id).exists() {
+            fs::remove_dir_all(data_dir(id))?;
+        }
+        Ok(())
     }
 
     /// Loads installed plugin `id` on its own driver thread.
     async fn load(&self, id: &str) -> wasmtime::Result<Plugin> {
-        let directory = plugins_dir().join(id);
+        let directory = installed_dir().join(id);
         let manifest = Manifest::read(&directory.join("plugin.toml"))?;
+        fs::create_dir_all(data_dir(id))?;
         let plugin = Plugin::load(
             manifest,
             directory.join("plugin.wasm"),
+            data_dir(id),
             self.engine.clone(),
             self.linker.clone(),
         )
@@ -219,4 +226,14 @@ impl Plugins {
             .insert(id.to_owned(), plugin.clone());
         Ok(plugin)
     }
+}
+
+/// The directory holding one package directory per installed plugin.
+fn installed_dir() -> PathBuf {
+    plugins_dir().join("installed")
+}
+
+/// The private read-write directory of plugin `id`.
+fn data_dir(id: &str) -> PathBuf {
+    plugins_dir().join("data").join(id)
 }
