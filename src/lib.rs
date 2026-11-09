@@ -22,7 +22,7 @@ pub use plugin::{Capability, Plugin};
 
 use next_paths::plugins_dir;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -85,25 +85,16 @@ impl Plugins {
         })
     }
 
-    /// Reads the manifests of installed packages.
+    /// Reads the manifests of installed packages, in no particular order.
     ///
-    /// Reads `plugin.toml` from every immediate child directory. Other entries
-    /// are skipped. Results follow filesystem order and are not cached.
+    /// A package whose manifest cannot be read is left out; [`Plugins::reload`]
+    /// reports it. Results are not cached.
     ///
     /// # Errors
     ///
-    /// Returns an error if the plugins directory cannot be read, an entry's type
-    /// cannot be determined, or any directory's manifest cannot be read or parsed.
+    /// Returns an error if the plugins directory cannot be read.
     pub fn list(&self) -> wasmtime::Result<Vec<Manifest>> {
-        let mut manifests = Vec::new();
-        for entry in fs::read_dir(installed_dir())? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                let manifest = Manifest::read(&entry.path())?;
-                manifests.push(manifest);
-            }
-        }
-        Ok(manifests)
+        Ok(installed()?.into_values().flatten().collect())
     }
 
     /// Brings the loaded plugins in line with the installed packages.
@@ -121,21 +112,21 @@ impl Plugins {
     ///
     /// Returns an error if the plugins directory cannot be read.
     pub async fn reload(&self) -> wasmtime::Result<Vec<(String, wasmtime::Error)>> {
-        let mut installed = HashSet::new();
-        for entry in fs::read_dir(installed_dir())? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                installed.insert(entry.file_name().to_string_lossy().into_owned());
-            }
-        }
+        let installed = installed()?;
         self.loaded
             .lock()
             .unwrap()
-            .retain(|id, _| installed.contains(id));
+            .retain(|id, _| installed.contains_key(id));
         let mut failed = Vec::new();
-        for id in installed {
-            let loaded = self.loaded.lock().unwrap().contains_key(&id);
-            if !loaded && let Err(error) = self.load(&id).await {
+        for (id, manifest) in installed {
+            if self.loaded.lock().unwrap().contains_key(&id) {
+                continue;
+            }
+            let loaded = match manifest {
+                Ok(manifest) => self.load(&id, manifest).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = loaded {
                 failed.push((id, error));
             }
         }
@@ -205,12 +196,24 @@ impl Plugins {
     }
 
     /// Loads installed plugin `id` on its own driver thread.
-    async fn load(&self, id: &str) -> wasmtime::Result<()> {
-        let manifest = Manifest::read(&package_dir(id))?;
+    async fn load(&self, id: &str, manifest: Manifest) -> wasmtime::Result<()> {
         let plugin = Instance::load(manifest, self.linker.clone()).await?;
         self.loaded.lock().unwrap().insert(id.to_owned(), plugin);
         Ok(())
     }
+}
+
+/// Reads the manifest of every installed package, by plugin ID.
+fn installed() -> wasmtime::Result<HashMap<String, wasmtime::Result<Manifest>>> {
+    let mut installed = HashMap::new();
+    for entry in fs::read_dir(installed_dir())? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            installed.insert(id, Manifest::read(&entry.path()));
+        }
+    }
+    Ok(installed)
 }
 
 /// The directory holding one package directory per installed plugin.
