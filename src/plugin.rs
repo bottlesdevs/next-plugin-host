@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, path::PathBuf, sync::Arc};
+use std::{fs, marker::PhantomData, sync::Arc};
 
 use futures::{
     future::BoxFuture,
@@ -6,13 +6,13 @@ use futures::{
 };
 use tokio::sync::{mpsc, oneshot};
 use wasmtime::{
-    Engine, Store,
+    Store,
     component::{Accessor, Component, Instance, Linker, ResourceTable},
 };
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
-use crate::Manifest;
+use crate::{Manifest, component_path, data_dir, package_dir};
 
 pub(crate) struct WasiState {
     pub(crate) table: ResourceTable,
@@ -42,10 +42,10 @@ impl WasiHttpView for WasiState {
 type Call =
     Box<dyn for<'a> FnOnce(&'a Accessor<WasiState>, &'a Instance) -> BoxFuture<'a, ()> + Send>;
 
-pub(crate) struct Shared {
+struct Shared {
     manifest: Manifest,
     component: Component,
-    pub(crate) calls: mpsc::UnboundedSender<Call>,
+    calls: mpsc::UnboundedSender<Call>,
 }
 
 /// Holds a loaded guest instance shared by its capability handles.
@@ -66,7 +66,7 @@ pub(crate) struct Shared {
 /// let library = plugin.cast::<bottles_plugin_host::Library>();
 /// ```
 pub struct Plugin<C = ()> {
-    pub(crate) shared: Arc<Shared>,
+    shared: Arc<Shared>,
     capability: PhantomData<fn() -> C>,
 }
 
@@ -111,17 +111,33 @@ impl<C> Plugin<C> {
     pub fn manifest(&self) -> &Manifest {
         &self.shared.manifest
     }
+
+    /// Queues `f` on the plugin's driver and waits for its result.
+    pub(crate) async fn call<R: Send + 'static>(
+        &self,
+        f: impl for<'a> FnOnce(
+            &'a Accessor<WasiState>,
+            &'a Instance,
+        ) -> BoxFuture<'a, wasmtime::Result<R>>
+        + Send
+        + 'static,
+    ) -> wasmtime::Result<R> {
+        let (send, receive) = oneshot::channel();
+        self.shared
+            .calls
+            .send(Box::new(move |accessor, instance| {
+                Box::pin(async move {
+                    let _ = send.send(f(accessor, instance).await);
+                })
+            }))
+            .map_err(|_| wasmtime::Error::msg("plugin driver is closed"))?;
+        receive
+            .await
+            .map_err(|_| wasmtime::Error::msg("plugin driver is closed"))?
+    }
 }
 
 impl Plugin {
-    /// Reports whether this component exports the named interface.
-    fn exports(&self, interface: &str) -> bool {
-        self.shared
-            .component
-            .get_export_index(None, interface)
-            .is_some()
-    }
-
     /// Returns a shared handle when this component exports the capability's interface.
     ///
     /// Returns [`None`] when the exact versioned name in [`Capability::INTERFACE`]
@@ -139,19 +155,21 @@ impl Plugin {
     /// }
     /// ```
     pub fn cast<C: Capability>(&self) -> Option<Plugin<C>> {
-        self.exports(C::INTERFACE).then(|| Plugin {
-            shared: self.shared.clone(),
-            capability: PhantomData,
-        })
+        self.shared
+            .component
+            .get_export_index(None, C::INTERFACE)
+            .is_some()
+            .then(|| Plugin {
+                shared: self.shared.clone(),
+                capability: PhantomData,
+            })
     }
 
     pub(crate) async fn load(
         manifest: Manifest,
-        path: PathBuf,
-        data: PathBuf,
-        engine: Engine,
         linker: Linker<WasiState>,
     ) -> wasmtime::Result<Self> {
+        let id = manifest.id.clone();
         let (calls, incoming) = mpsc::unbounded_channel::<Call>();
         let (ready_send, ready_receive) = oneshot::channel();
         std::thread::Builder::new()
@@ -161,9 +179,7 @@ impl Plugin {
                     .enable_all()
                     .build()
                 {
-                    Ok(runtime) => {
-                        runtime.block_on(drive(engine, linker, path, data, ready_send, incoming))
-                    }
+                    Ok(runtime) => runtime.block_on(drive(linker, id, ready_send, incoming)),
                     Err(error) => {
                         let _ = ready_send.send(Err(error.into()));
                     }
@@ -184,21 +200,21 @@ impl Plugin {
 }
 
 async fn drive(
-    engine: Engine,
     linker: Linker<WasiState>,
-    path: PathBuf,
-    data: PathBuf,
+    id: String,
     ready_send: oneshot::Sender<wasmtime::Result<Component>>,
     mut incoming: mpsc::UnboundedReceiver<Call>,
 ) {
     let result = async {
-        let component = Component::from_file(&engine, path)?;
+        let engine = linker.engine();
+        let component = Component::from_file(engine, component_path(&package_dir(&id)))?;
         let pre = linker.instantiate_pre(&component)?;
+        fs::create_dir_all(data_dir(&id))?;
         let mut wasi = WasiCtxBuilder::new();
         wasi.inherit_stderr()
-            .preopened_dir(data, ".", FsPerms::ReadWrite)?;
+            .preopened_dir(data_dir(&id), ".", FsPerms::ReadWrite)?;
         let mut store = Store::new(
-            &engine,
+            engine,
             WasiState {
                 table: ResourceTable::new(),
                 wasi: wasi.build(),
@@ -231,23 +247,4 @@ async fn drive(
             }
         })
         .await;
-}
-
-pub(crate) async fn call<R: Send + 'static>(
-    calls: &mpsc::UnboundedSender<Call>,
-    f: impl for<'a> FnOnce(&'a Accessor<WasiState>, &'a Instance) -> BoxFuture<'a, wasmtime::Result<R>>
-    + Send
-    + 'static,
-) -> wasmtime::Result<R> {
-    let (send, receive) = oneshot::channel();
-    calls
-        .send(Box::new(move |accessor, instance| {
-            Box::pin(async move {
-                let _ = send.send(f(accessor, instance).await);
-            })
-        }))
-        .map_err(|_| wasmtime::Error::msg("plugin driver is closed"))?;
-    receive
-        .await
-        .map_err(|_| wasmtime::Error::msg("plugin driver is closed"))?
 }

@@ -5,7 +5,7 @@ use wasmtime::component::{Accessor, HasSelf, Linker, Resource};
 
 use crate::{
     Capability, interfaces,
-    plugin::{Plugin, WasiState, call},
+    plugin::{Plugin, WasiState},
 };
 
 /// Supplies user input requested by a plugin during account linking.
@@ -99,7 +99,7 @@ impl Plugin<Account> {
         &self,
         interaction: Arc<dyn Interaction>,
     ) -> wasmtime::Result<AccountIdentity> {
-        call(&self.shared.calls, move |accessor, instance| {
+        self.call(move |accessor, instance| {
             Box::pin(async move {
                 let bindings =
                     accessor.with(|mut access| bindings::Account::new(&mut access, instance))?;

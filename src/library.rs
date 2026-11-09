@@ -1,4 +1,4 @@
-use crate::{Capability, Plugin, interfaces, plugin::call};
+use crate::{Capability, Plugin, interfaces};
 
 /// Marker for plugins that export the library-provider interface.
 ///
@@ -46,7 +46,7 @@ impl Plugin<Library> {
     /// Returns an error if the driver is closed, the bindings cannot be
     /// constructed, or the guest reports a failure.
     pub async fn list_entries(&self) -> wasmtime::Result<Vec<LibraryEntry>> {
-        call(&self.shared.calls, |accessor, instance| {
+        self.call(|accessor, instance| {
             Box::pin(async move {
                 let bindings =
                     accessor.with(|mut access| bindings::Library::new(&mut access, instance))?;
@@ -70,7 +70,7 @@ impl Plugin<Library> {
     /// constructed, or the guest reports a failure.
     pub async fn launch(&self, entry_id: &str) -> wasmtime::Result<()> {
         let entry_id = entry_id.to_owned();
-        call(&self.shared.calls, move |accessor, instance| {
+        self.call(move |accessor, instance| {
             Box::pin(async move {
                 let bindings =
                     accessor.with(|mut access| bindings::Library::new(&mut access, instance))?;
