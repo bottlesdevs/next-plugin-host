@@ -10,7 +10,7 @@ use crate::{Capability, Plugin, interfaces};
 /// # Examples
 ///
 /// ```text
-/// if let Some(library) = plugin.cast::<bottles_plugin_host::Library>() {
+/// if let Some(library) = plugins.get::<bottles_plugin_host::Library>("example") {
 ///     for entry in library.list_entries().await? {
 ///         println!("{}: {}", entry.id, entry.title);
 ///     }

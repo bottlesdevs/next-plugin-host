@@ -7,7 +7,7 @@ use futures::{
 use tokio::sync::{mpsc, oneshot};
 use wasmtime::{
     Store,
-    component::{Accessor, Component, Instance, Linker, ResourceTable},
+    component::{Accessor, Component, Instance as WasmInstance, Linker, ResourceTable},
 };
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
@@ -40,20 +40,19 @@ impl WasiHttpView for WasiState {
 }
 
 type Call =
-    Box<dyn for<'a> FnOnce(&'a Accessor<WasiState>, &'a Instance) -> BoxFuture<'a, ()> + Send>;
+    Box<dyn for<'a> FnOnce(&'a Accessor<WasiState>, &'a WasmInstance) -> BoxFuture<'a, ()> + Send>;
 
-struct Shared {
+/// A running plugin, shared by its capability handles.
+pub(crate) struct Instance {
     manifest: Manifest,
     component: Component,
     calls: mpsc::UnboundedSender<Call>,
 }
 
-/// Holds a loaded guest instance shared by its capability handles.
+/// A handle to a loaded plugin exposing capability `C`'s calls.
 ///
-/// [`crate::Plugins::get`] returns `Plugin<()>`, and
-/// [`crate::Plugins::providing`] returns typed handles. Use [`cast`](Plugin::cast)
-/// to obtain a typed handle exposing a capability's calls. Clones and casts share
-/// the store and guest state; they do not instantiate another component.
+/// Obtained from [`crate::Plugins::get`] or [`crate::Plugins::providing`]. Every
+/// handle to a plugin shares its store and guest state.
 ///
 /// Handles and pending calls retain the driver's call channel.
 /// The driver exits when it observes that all senders have been dropped.
@@ -61,12 +60,11 @@ struct Shared {
 /// # Examples
 ///
 /// ```text
-/// let plugin = plugins.get("example").expect("loaded");
-/// let account = plugin.cast::<bottles_plugin_host::Account>();
-/// let library = plugin.cast::<bottles_plugin_host::Library>();
+/// let account = plugins.get::<bottles_plugin_host::Account>("example");
+/// let library = plugins.get::<bottles_plugin_host::Library>("example");
 /// ```
-pub struct Plugin<C = ()> {
-    shared: Arc<Shared>,
+pub struct Plugin<C> {
+    shared: Arc<Instance>,
     capability: PhantomData<fn() -> C>,
 }
 
@@ -94,7 +92,7 @@ impl<C> Clone for Plugin<C> {
 /// let name = <Library as Capability>::INTERFACE; // "bottles:plugin/library-provider@0.1.0"
 /// ```
 pub trait Capability {
-    /// Names the versioned WIT interface required for a cast.
+    /// Names the versioned WIT interface a plugin must export to provide this capability.
     const INTERFACE: &'static str;
 }
 
@@ -118,7 +116,7 @@ impl<C> Plugin<C> {
         &self,
         f: impl for<'a> FnOnce(
             &'a Accessor<WasiState>,
-            &'a Instance,
+            &'a WasmInstance,
         ) -> BoxFuture<'a, wasmtime::Result<R>>
         + Send
         + 'static,
@@ -138,38 +136,28 @@ impl<C> Plugin<C> {
     }
 }
 
-impl Plugin {
-    /// Returns a shared handle when this component exports the capability's interface.
+impl Instance {
+    /// Returns a handle for capability `C` when this component exports its interface.
     ///
     /// Returns [`None`] when the exact versioned name in [`Capability::INTERFACE`]
     /// is absent. This checks only that name, not function signatures. The
     /// adapter binds its world on each invocation, where incompatibilities are
     /// returned as call errors.
-    ///
-    /// Each successful cast retains the same guest instance and its state.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// if let Some(library) = plugin.cast::<bottles_plugin_host::Library>() {
-    ///     let entries = library.list_entries().await?;
-    /// }
-    /// ```
-    pub fn cast<C: Capability>(&self) -> Option<Plugin<C>> {
-        self.shared
-            .component
+    pub(crate) fn handle<C: Capability>(self: &Arc<Self>) -> Option<Plugin<C>> {
+        self.component
             .get_export_index(None, C::INTERFACE)
             .is_some()
             .then(|| Plugin {
-                shared: self.shared.clone(),
+                shared: self.clone(),
                 capability: PhantomData,
             })
     }
 
+    /// Starts the plugin on its own driver thread.
     pub(crate) async fn load(
         manifest: Manifest,
         linker: Linker<WasiState>,
-    ) -> wasmtime::Result<Self> {
+    ) -> wasmtime::Result<Arc<Self>> {
         let id = manifest.id.clone();
         let (calls, incoming) = mpsc::unbounded_channel::<Call>();
         let (ready, started) = oneshot::channel();
@@ -189,14 +177,11 @@ impl Plugin {
         let component = started
             .await
             .map_err(|_| wasmtime::Error::msg("plugin driver stopped before initialization"))??;
-        Ok(Self {
-            shared: Arc::new(Shared {
-                manifest,
-                component,
-                calls,
-            }),
-            capability: PhantomData,
-        })
+        Ok(Arc::new(Self {
+            manifest,
+            component,
+            calls,
+        }))
     }
 }
 
