@@ -70,6 +70,7 @@ pub struct Plugin<C = ()> {
     capability: PhantomData<fn() -> C>,
 }
 
+// Written by hand because `#[derive(Clone)]` would require `C: Clone`.
 impl<C> Clone for Plugin<C> {
     fn clone(&self) -> Self {
         Self {
