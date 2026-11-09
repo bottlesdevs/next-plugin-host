@@ -123,16 +123,16 @@ impl<C> Plugin<C> {
         + Send
         + 'static,
     ) -> wasmtime::Result<R> {
-        let (send, receive) = oneshot::channel();
+        let (reply, response) = oneshot::channel();
         self.shared
             .calls
             .send(Box::new(move |accessor, instance| {
                 Box::pin(async move {
-                    let _ = send.send(f(accessor, instance).await);
+                    let _ = reply.send(f(accessor, instance).await);
                 })
             }))
             .map_err(|_| wasmtime::Error::msg("plugin driver is closed"))?;
-        receive
+        response
             .await
             .map_err(|_| wasmtime::Error::msg("plugin driver is closed"))?
     }
@@ -172,7 +172,7 @@ impl Plugin {
     ) -> wasmtime::Result<Self> {
         let id = manifest.id.clone();
         let (calls, incoming) = mpsc::unbounded_channel::<Call>();
-        let (ready_send, ready_receive) = oneshot::channel();
+        let (ready, started) = oneshot::channel();
         std::thread::Builder::new()
             .name(format!("plugin-{}", manifest.id))
             .spawn(move || {
@@ -180,13 +180,13 @@ impl Plugin {
                     .enable_all()
                     .build()
                 {
-                    Ok(runtime) => runtime.block_on(drive(linker, id, ready_send, incoming)),
+                    Ok(runtime) => runtime.block_on(drive(linker, id, ready, incoming)),
                     Err(error) => {
-                        let _ = ready_send.send(Err(error.into()));
+                        let _ = ready.send(Err(error.into()));
                     }
                 }
             })?;
-        let component = ready_receive
+        let component = started
             .await
             .map_err(|_| wasmtime::Error::msg("plugin driver stopped before initialization"))??;
         Ok(Self {
@@ -203,7 +203,7 @@ impl Plugin {
 async fn drive(
     linker: Linker<WasiState>,
     id: String,
-    ready_send: oneshot::Sender<wasmtime::Result<Component>>,
+    ready: oneshot::Sender<wasmtime::Result<Component>>,
     mut incoming: mpsc::UnboundedReceiver<Call>,
 ) {
     let result = async {
@@ -229,11 +229,11 @@ async fn drive(
     let (mut store, instance, component) = match result {
         Ok(value) => value,
         Err(error) => {
-            let _ = ready_send.send(Err(error));
+            let _ = ready.send(Err(error));
             return;
         }
     };
-    let _ = ready_send.send(Ok(component));
+    let _ = ready.send(Ok(component));
     let _ = store
         .run_concurrent(async |accessor| {
             let mut active = FuturesUnordered::new();
