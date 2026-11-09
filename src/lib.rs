@@ -25,18 +25,18 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 use wasmtime::{Cache, CacheConfig, Engine, component::Linker};
 
-use plugin::WasiState;
+use plugin::{Instance, WasiState};
 
 /// Owns the installed plugin packages and one loaded instance of each.
 ///
 /// Packages live under the application's plugins directory at
 /// `installed/<id>/plugin.toml` and `installed/<id>/plugin.wasm`, and each
 /// plugin's private data at `data/<id>/`. Each installed plugin has at most
-/// one loaded instance, shared by every handle and capability cast from it.
+/// one loaded instance, shared by every handle to it.
 ///
 /// # Examples
 ///
@@ -52,7 +52,7 @@ use plugin::WasiState;
 pub struct Plugins {
     linker: Linker<WasiState>,
     /// Loaded plugins, by ID.
-    loaded: Mutex<HashMap<String, Plugin>>,
+    loaded: Mutex<HashMap<String, Arc<Instance>>>,
 }
 
 impl Plugins {
@@ -134,18 +134,17 @@ impl Plugins {
             .retain(|id, _| installed.contains(id));
         let mut failed = Vec::new();
         for id in installed {
-            if self.get(&id).is_none()
-                && let Err(error) = self.load(&id).await
-            {
+            let loaded = self.loaded.lock().unwrap().contains_key(&id);
+            if !loaded && let Err(error) = self.load(&id).await {
                 failed.push((id, error));
             }
         }
         Ok(failed)
     }
 
-    /// Returns the loaded plugin with ID `id`.
-    pub fn get(&self, id: &str) -> Option<Plugin> {
-        self.loaded.lock().unwrap().get(id).cloned()
+    /// Returns plugin `id` if it is loaded and provides capability `C`.
+    pub fn get<C: Capability>(&self, id: &str) -> Option<Plugin<C>> {
+        self.loaded.lock().unwrap().get(id)?.handle()
     }
 
     /// Returns every loaded plugin that provides capability `C`.
@@ -162,7 +161,7 @@ impl Plugins {
             .lock()
             .unwrap()
             .values()
-            .filter_map(Plugin::cast)
+            .filter_map(Instance::handle)
             .collect()
     }
 
@@ -206,14 +205,11 @@ impl Plugins {
     }
 
     /// Loads installed plugin `id` on its own driver thread.
-    async fn load(&self, id: &str) -> wasmtime::Result<Plugin> {
+    async fn load(&self, id: &str) -> wasmtime::Result<()> {
         let manifest = Manifest::read(&package_dir(id))?;
-        let plugin = Plugin::load(manifest, self.linker.clone()).await?;
-        self.loaded
-            .lock()
-            .unwrap()
-            .insert(id.to_owned(), plugin.clone());
-        Ok(plugin)
+        let plugin = Instance::load(manifest, self.linker.clone()).await?;
+        self.loaded.lock().unwrap().insert(id.to_owned(), plugin);
+        Ok(())
     }
 }
 

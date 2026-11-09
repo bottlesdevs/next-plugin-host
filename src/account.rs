@@ -29,7 +29,7 @@ pub trait Interaction: Send + Sync {
 /// # Examples
 ///
 /// ```text
-/// if let Some(account) = plugin.cast::<bottles_plugin_host::Account>() {
+/// if let Some(account) = plugins.get::<bottles_plugin_host::Account>("example") {
 ///     let identity = account.link_account(interaction).await?;
 ///     println!("{}", identity.display_name);
 /// }

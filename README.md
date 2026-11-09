@@ -9,8 +9,8 @@ instances, and call the capabilities they want to offer.
 [`Plugins`] owns the installed packages and one loaded instance of each.
 [`Plugins::reload`] brings the loaded plugins in line with the installed ones, and
 [`Plugins::providing`] returns a typed handle, such as [`Plugin<Library>`], for
-every loaded plugin that provides that capability. [`Plugins::get`] returns one
-loaded plugin, which [`Plugin::cast`] turns into a typed handle.
+every loaded plugin that provides that capability. [`Plugins::get`] returns the
+handle for one plugin.
 
 ```text
 use bottles_plugin_host::{Library, Plugins};
@@ -30,7 +30,7 @@ async fn list_plugin_entries() -> wasmtime::Result<()> {
 ```
 
 Typed handles share the loaded guest instance, so state created during account
-linking can be used by subsequent library calls. A cast checks the versioned
+linking can be used by subsequent library calls. Getting a handle checks the versioned
 export name; bindings are constructed when a capability method is invoked, and
 missing or incompatible functions fail at that point.
 
