@@ -59,8 +59,7 @@ version = "0.1.0"
 `plugin.wasm` is a component built with the guest SDK, `bottles-plugin-api`.
 [`Plugins::install`] copies these two files from a source directory, overwriting
 existing files, and [`Plugins::uninstall`] removes the directory. Both forget the
-loaded instance, and the next [`Plugins::reload`] applies the change. [`Plugins::list`] reads each directory's manifest in filesystem
-order. [`Plugins::new`] creates the catalog directory if it is missing. Package IDs are joined directly to the catalog path.
+loaded instance, and the next [`Plugins::reload`] applies the change. [`Plugins::list`] returns the manifests that can be read. [`Plugins::new`] creates the catalog directory if it is missing. Package IDs are joined directly to the catalog path.
 
 Each installed plugin has at most one loaded instance, owned by [`Plugins`]; handles
 to an instance that was replaced or unloaded keep it alive until they are dropped.
